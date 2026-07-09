@@ -1,0 +1,55 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+cd "${SCRIPT_DIR}"
+
+PYTHON_VERSION="${PYTHON_VERSION:-3.10}"
+
+export QWEN_API_BASE="${QWEN_API_BASE:-http://127.0.0.1:5440/v1}"
+export QWEN_MODEL="${QWEN_MODEL:-qwen3_omni}"
+export QWEN_PROVIDER="${QWEN_PROVIDER:-vllm_omni}"
+export TARGET_SAMPLE_RATE="${TARGET_SAMPLE_RATE:-16000}"
+export PREFILL_INTERVAL_MS="${PREFILL_INTERVAL_MS:-600}"
+export PREFILL_MODE="${PREFILL_MODE:-cumulative_probe}"
+export FINAL_MAX_TOKENS="${FINAL_MAX_TOKENS:-512}"
+export MAX_HISTORY_TURNS="${MAX_HISTORY_TURNS:-10}"
+export STREAM_FINAL_OUTPUT="${STREAM_FINAL_OUTPUT:-1}"
+export SILERO_VAD_ENABLED="${SILERO_VAD_ENABLED:-1}"
+export SILERO_VAD_PRELOAD="${SILERO_VAD_PRELOAD:-1}"
+export EASYTURN_ENABLED="${EASYTURN_ENABLED:-0}"
+export EASYTURN_API_URL="${EASYTURN_API_URL:-}"
+export SYSTEM_PROMPT_PATH="${SYSTEM_PROMPT_PATH:-${SCRIPT_DIR}/realtime_audio_demo/system_prompt.md}"
+
+if ! command -v uv >/dev/null 2>&1; then
+  echo "uv is not installed. Install uv first:"
+  echo "  curl -LsSf https://astral.sh/uv/install.sh | sh"
+  exit 1
+fi
+
+uv python install "${PYTHON_VERSION}"
+uv venv --python "${PYTHON_VERSION}"
+
+uv sync
+
+cat > .env.example <<EOF
+QWEN_API_BASE=${QWEN_API_BASE}
+QWEN_MODEL=${QWEN_MODEL}
+QWEN_PROVIDER=${QWEN_PROVIDER}
+TARGET_SAMPLE_RATE=${TARGET_SAMPLE_RATE}
+PREFILL_INTERVAL_MS=${PREFILL_INTERVAL_MS}
+PREFILL_MODE=${PREFILL_MODE}
+FINAL_MAX_TOKENS=${FINAL_MAX_TOKENS}
+MAX_HISTORY_TURNS=${MAX_HISTORY_TURNS}
+STREAM_FINAL_OUTPUT=${STREAM_FINAL_OUTPUT}
+SILERO_VAD_ENABLED=${SILERO_VAD_ENABLED}
+SILERO_VAD_PRELOAD=${SILERO_VAD_PRELOAD}
+EASYTURN_ENABLED=${EASYTURN_ENABLED}
+EASYTURN_API_URL=${EASYTURN_API_URL}
+SYSTEM_PROMPT_PATH=${SYSTEM_PROMPT_PATH}
+EOF
+
+echo "uv environment ready"
+echo "python: ${PYTHON_VERSION}"
+echo "model: ${QWEN_MODEL}"
+echo "next: ./run_chatbox.sh"
