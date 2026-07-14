@@ -5,7 +5,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "${SCRIPT_DIR}"
 
 export QWEN_API_BASE="${QWEN_API_BASE:-http://127.0.0.1:5440/v1}"
-export QWEN_MODEL="${QWEN_MODEL:-qwen3_omni}"
+export QWEN_MODEL="${QWEN_MODEL:-qwen3-omni}"
 export QWEN_PROVIDER="${QWEN_PROVIDER:-vllm_omni}"
 export PREFILL_INTERVAL_MS="${PREFILL_INTERVAL_MS:-600}"
 export PREFILL_MODE="${PREFILL_MODE:-cumulative_probe}"
@@ -19,7 +19,7 @@ export EASYTURN_ACK_TEXT="${EASYTURN_ACK_TEXT:-嗯，我在听，你继续。}"
 export SYSTEM_PROMPT_PATH="${SYSTEM_PROMPT_PATH:-${SCRIPT_DIR}/realtime_audio_demo/system_prompt.md}"
 
 HOST="${HOST:-0.0.0.0}"
-PORT="${PORT:-55785}"
+PORT="${PORT:-56010}"
 PID_FILE="${PID_FILE:-${SCRIPT_DIR}/chatbox.pid}"
 LOG_FILE="${LOG_FILE:-${SCRIPT_DIR}/chatbox.log}"
 
