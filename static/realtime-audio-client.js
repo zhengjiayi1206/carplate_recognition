@@ -643,6 +643,14 @@ export class RealtimeAudioClient extends EventTarget {
           this.setVoiceState("模型输出中");
         }
         break;
+      case "processing_ack":
+        this.emit("ack", { text: data.speech_text || "", audio_url: data.audio_data_url });
+        this.setVoiceState("处理中");
+        if (data.audio_data_url) {
+          this.enqueueAudio(data.audio_data_url, -1, data.speech_text || "");
+          if (this.state.mode === "finalizing") this.setMode("speaking");
+        }
+        break;
       case "turn_incomplete": this.handleTurnIncomplete(data); break;
       case "turn_complete": this.log(`easyturn ${data.turn_state} latency=${data.latency_ms}ms`); break;
       case "turn_error": this.log(`easyturn error: ${data.message || ""}`, "error"); break;
@@ -674,9 +682,9 @@ export class RealtimeAudioClient extends EventTarget {
     if (data.text) {
       this.state.finalText = data.text;
       this.state.finalHistoryText = typeof data.history_text === "string" ? data.history_text : data.text;
-      this.emit("result", { text: data.text, replace: true });
+      this.emit("result", { text: data.text, replace: true, _newBubble: true });
     } else if (!this.state.streamingTextStarted) {
-      this.emit("result", { text: "服务端没有返回文本。", replace: true });
+      this.emit("result", { text: "服务端没有返回文本。", replace: true, _newBubble: true });
       this.state.finalText = ""; this.state.finalHistoryText = "";
     } else {
       this.state.finalText = currentText;

@@ -6,7 +6,7 @@ import re
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable, Optional
 
 from realtime_audio_demo.config import QWEN_MODEL
 from realtime_audio_demo.services.interfaces import ChatModel
@@ -17,6 +17,8 @@ logger = logging.getLogger("uvicorn.error")
 
 NO_PLATE_REPLY = "我没有听到车牌号内容，请告诉我车牌号。"
 INVALID_PLATE_REPLY = "您好，您当前的车牌号并不是有效号码，请重新输入。"
+PLATE_PRESENCE_ACK = "好的，我听到了您说的车牌的信息了。"
+CONFIRMATION_NO_ACK = "嗯嗯，目前的车牌信息有错误，我新写的一版，您再说一次新的内容，看看还有没有问题。"
 
 CAR_PLATE_EXTRACTION_PROMPT_PATH = Path(__file__).resolve().parents[1] / "car_plate_extraction_prompt.md"
 CAR_PLATE_EXTRACTION_PROMPT = CAR_PLATE_EXTRACTION_PROMPT_PATH.read_text(encoding="utf-8").strip()
@@ -83,6 +85,7 @@ class PlateAgentState:
     confusions: list[PlateConfusion] = field(default_factory=list)
     final_car_plate: str = ""
     assistant_reply: str = ""
+    ack_sent: bool = False
 
     @property
     def has_car_plate(self) -> bool:
@@ -98,6 +101,7 @@ class PlateAgentState:
             "vehicle_type": self.vehicle_type,
             "confusions": [item.to_dict() for item in self.confusions],
             "final_car_plate": self.final_car_plate,
+            "ack_sent": self.ack_sent,
         }
 
 
@@ -121,6 +125,7 @@ class PlateAgentService:
         model: str,
         wav_bytes: bytes,
         state: PlateAgentState,
+        on_ack: Optional[Callable] = None,
     ) -> PlateAgentResult:
         started = time.perf_counter()
         debug: dict[str, Any] = {}
@@ -136,6 +141,7 @@ class PlateAgentService:
                     assistant_reply=NO_PLATE_REPLY,
                 )
                 working.assistant_reply = NO_PLATE_REPLY
+                working.ack_sent = False
                 latency_ms = elapsed_ms(started)
                 log_node_output(
                     "turn_result",
@@ -156,6 +162,13 @@ class PlateAgentService:
                     debug=debug,
                 )
 
+            if not state.ack_sent:
+                working.ack_sent = True
+                if on_ack is not None:
+                    await on_ack(PLATE_PRESENCE_ACK)
+
+            working.ack_sent = False
+
             car_plate = await self.extract_car_plate(model=model, wav_bytes=wav_bytes)
             vehicle_type = vehicle_type_by_length(car_plate)
             if vehicle_type == "unknown":
@@ -169,6 +182,7 @@ class PlateAgentService:
             working.car_plate = car_plate
             working.final_car_plate = ""
             working.vehicle_type = vehicle_type
+            working.ack_sent = False
             log_node_output(
                 "resolve_vehicle_type_by_length",
                 {
@@ -224,6 +238,7 @@ class PlateAgentService:
         debug["confirmation"] = confirmation
         if confirmation:
             working.final_car_plate = working.car_plate
+            working.ack_sent = False
             assistant_reply = f"好的，已确认您的车牌号是{working.final_car_plate}。"
             working.assistant_reply = assistant_reply
             output = build_output_json(
@@ -251,6 +266,13 @@ class PlateAgentService:
                 latency_ms=latency_ms,
                 debug=debug,
             )
+
+        if not state.ack_sent:
+            working.ack_sent = True
+            if on_ack is not None:
+                await on_ack(CONFIRMATION_NO_ACK)
+
+        working.ack_sent = False
 
         new_car_plate = await self.update_car_plate(model=model, wav_bytes=wav_bytes, state=working)
         if new_car_plate:
@@ -343,6 +365,7 @@ class PlateAgentService:
         working.confusions = []
         working.final_car_plate = ""
         working.assistant_reply = INVALID_PLATE_REPLY
+        working.ack_sent = False
         latency_ms = elapsed_ms(started)
         result_debug = {
             **debug,
@@ -804,6 +827,7 @@ def clone_state(state: PlateAgentState) -> PlateAgentState:
         confusions=confusions,
         final_car_plate=state.final_car_plate,
         assistant_reply=state.assistant_reply,
+        ack_sent=state.ack_sent,
     )
 
 

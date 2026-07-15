@@ -1,4 +1,5 @@
 import asyncio
+import base64
 import json
 import logging
 import time
@@ -6,7 +7,7 @@ from pathlib import Path
 from typing import Any
 
 from fastapi import APIRouter, Request, WebSocket, WebSocketDisconnect
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 
 from realtime_audio_demo.config import (
     CAPTURE_DIR,
@@ -82,6 +83,79 @@ async def chatbox_audio(request: Request) -> JSONResponse:
         return error_response
     result, status_code = await chatbox_service.handle_audio(payload)
     return JSONResponse(result, status_code=status_code)
+
+
+@router.post("/api/chatbox/audio/stream")
+async def chatbox_audio_stream(request: Request) -> StreamingResponse:
+    payload, error_response = await read_json_object(request)
+    if error_response is not None:
+        return error_response
+
+    audio_base64 = str(payload.get("audio_base64") or "").strip()
+    if not audio_base64:
+        return JSONResponse({"message": "audio_base64 is required"}, status_code=400)
+    if "," in audio_base64 and audio_base64.startswith("data:"):
+        audio_base64 = audio_base64.split(",", 1)[1]
+    try:
+        wav_bytes = base64.b64decode(audio_base64, validate=True)
+    except Exception as exc:
+        return JSONResponse({"message": f"bad audio_base64: {exc}"}, status_code=400)
+
+    model = normalize_model_name(payload.get("model") or QWEN_MODEL)
+    session_id = str(payload.get("session_id") or "").strip()
+    state = await get_plate_agent_state(session_id) if session_id else PlateAgentState()
+    agent = get_plate_agent_service(model_gateway)
+    should_synthesize = bool(payload.get("outputAudio"))
+
+    async def event_stream():
+        ack_queue: asyncio.Queue[str] = asyncio.Queue()
+
+        async def on_ack(text: str) -> None:
+            await ack_queue.put(text)
+
+        agent_task = asyncio.create_task(
+            agent.handle_audio_turn(
+                model=model, wav_bytes=wav_bytes, state=state, on_ack=on_ack,
+            )
+        )
+
+        # Yield ack events as they arrive from the agent
+        while not agent_task.done() or not ack_queue.empty():
+            try:
+                ack_text = await asyncio.wait_for(ack_queue.get(), timeout=0.2)
+                ack_event: dict[str, Any] = {"stage": "ack", "speech_text": ack_text}
+                yield f"data: {json.dumps(ack_event, ensure_ascii=False)}\n\n"
+            except asyncio.TimeoutError:
+                continue
+
+        agent_result = await agent_task
+
+        # Persist state
+        if session_id:
+            await append_audio_history(session_id, wav_bytes)
+            await append_history(session_id, "assistant", agent_result.history_text)
+            await update_plate_agent_state(session_id, agent_result.state)
+
+        audio_data_url = None
+        if should_synthesize:
+            audio_data_url = await speech_synthesizer.synthesize(
+                model=model, text=agent_result.speech_text
+            )
+
+        result_event = {
+            "stage": "result",
+            "text": agent_result.text,
+            "audio_data_url": audio_data_url,
+            "history_text": agent_result.history_text,
+            "speech_text": agent_result.speech_text,
+            "output_is_json": True,
+            "latency_ms": agent_result.latency_ms,
+            "agent_state": agent_result.state.to_context(),
+        }
+        yield f"data: {json.dumps(result_event, ensure_ascii=False)}\n\n"
+        yield "data: [DONE]\n\n"
+
+    return StreamingResponse(event_stream(), media_type="text/event-stream")
 
 
 @router.websocket("/ws/audio")
@@ -550,10 +624,16 @@ async def finalize_session(session: AudioSession) -> None:
     try:
         state = await get_plate_agent_state(session.chat_session_id) if session.chat_session_id else PlateAgentState()
         agent = get_plate_agent_service(model_gateway)
+
+        async def on_ack(text: str) -> None:
+            audio_url = await synthesize_speech_audio(session.model, text) if session.output_audio else None
+            await send_event(session, "processing_ack", {"speech_text": text, "audio_data_url": audio_url})
+
         agent_result = await agent.handle_audio_turn(
             model=session.model,
             wav_bytes=wav,
             state=state,
+            on_ack=on_ack,
         )
     except Exception as exc:
         await send_event(

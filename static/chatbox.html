@@ -609,7 +609,7 @@
     <div class="toast" id="toast" role="status" aria-live="polite"></div>
 
     <script type="module">
-      import { RealtimeAudioClient } from "/static/realtime-audio-client.js?v=chatbox-mode-20260624-3";
+      import { RealtimeAudioClient } from "/static/realtime-audio-client.js?v=chatbox-ack-20260715-1";
 
       const els = {
         appShell: document.getElementById("appShell"),
@@ -801,7 +801,22 @@
         }
       });
 
-      client.on("result", ({ text, append, replace, loading }) => {
+      client.on("ack", ({ text, audio_url }) => {
+        const ackText = text || "";
+        if (
+          assistantBubble &&
+          ["正在推理。", "判断是否说完。", "正在生成..."].includes(assistantBubble.textContent)
+        ) {
+          assistantBubble.classList.remove("loading");
+          assistantBubble.textContent = ackText;
+        } else {
+          assistantBubble = appendBubble("assistant", ackText);
+        }
+        scrollToBottom();
+      });
+
+      client.on("result", ({ text, append, replace, loading, _newBubble }) => {
+        if (_newBubble) assistantBubble = null;
         if (replace && text === "录音中。") {
           const lastUser = lastBubble("user");
           if (lastUser) lastUser.textContent = "语音输入中...";
