@@ -609,7 +609,7 @@
     <div class="toast" id="toast" role="status" aria-live="polite"></div>
 
     <script type="module">
-      import { RealtimeAudioClient } from "/static/realtime-audio-client.js?v=chatbox-ack-20260715-1";
+      import { RealtimeAudioClient } from "/static/realtime-audio-client.js?v=chatbox-stream-tts-20260715-1";
 
       const els = {
         appShell: document.getElementById("appShell"),
@@ -883,6 +883,9 @@
             return;
           }
           stopTextAudio();
+          if (outputAudioEnabled()) {
+            await client.unlockAudioOutput();
+          }
           if (client.state.mode === "idle") {
             await client.startRecording();
           } else if (client.state.mode === "recording") {

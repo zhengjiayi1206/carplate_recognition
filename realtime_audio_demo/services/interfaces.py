@@ -89,6 +89,16 @@ class SpeechSynthesizer(ABC):
     async def synthesize(self, *, model: str, text: str) -> str | None:
         raise NotImplementedError
 
+    @abstractmethod
+    async def stream_synthesize(
+        self,
+        *,
+        model: str,
+        text: str,
+        on_audio_chunk: Callable[[bytes], Any],
+    ) -> bool:
+        raise NotImplementedError
+
 
 class TurnDetector(ABC):
     @abstractmethod

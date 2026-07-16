@@ -19,6 +19,8 @@ from realtime_audio_demo.config import (
     QWEN_API_BASE,
     QWEN_MODEL,
     SILERO_VAD_ENABLED,
+    TTS_SAMPLE_RATE,
+    TTS_STREAM_RESPONSE_FORMAT,
     normalize_model_name,
 )
 from realtime_audio_demo.events import send_event
@@ -49,6 +51,85 @@ from realtime_audio_demo.utils.audio import float32_sample_count, wav_bytes_from
 
 router = APIRouter()
 logger = logging.getLogger("uvicorn.error")
+
+
+def sse_data_event(payload: dict[str, Any]) -> str:
+    return f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
+
+
+async def stream_speech_sse_events(
+    *,
+    model: str,
+    text: str,
+    segment: str,
+    audio_index: int,
+):
+    speech_text = text.strip()
+    if not speech_text:
+        return
+    yield sse_data_event(
+        {
+            "stage": "tts_audio_start",
+            "segment": segment,
+            "audio_index": audio_index,
+            "format": TTS_STREAM_RESPONSE_FORMAT,
+            "sample_rate": TTS_SAMPLE_RATE,
+            "speech_text": speech_text,
+        }
+    )
+
+    chunk_queue: asyncio.Queue[bytes] = asyncio.Queue()
+
+    async def on_chunk(chunk: bytes) -> None:
+        await chunk_queue.put(chunk)
+
+    tts_task = asyncio.create_task(
+        speech_synthesizer.stream_synthesize(
+            model=model,
+            text=speech_text,
+            on_audio_chunk=on_chunk,
+        )
+    )
+    while not tts_task.done() or not chunk_queue.empty():
+        try:
+            chunk = await asyncio.wait_for(chunk_queue.get(), timeout=0.2)
+        except asyncio.TimeoutError:
+            continue
+        yield sse_data_event(
+            {
+                "stage": "tts_audio_delta",
+                "segment": segment,
+                "audio_index": audio_index,
+                "format": TTS_STREAM_RESPONSE_FORMAT,
+                "sample_rate": TTS_SAMPLE_RATE,
+                "audio_base64": base64.b64encode(chunk).decode("ascii"),
+            }
+        )
+        chunk_queue.task_done()
+
+    ok = await tts_task
+    if ok:
+        yield sse_data_event(
+            {
+                "stage": "tts_audio_end",
+                "segment": segment,
+                "audio_index": audio_index,
+                "format": TTS_STREAM_RESPONSE_FORMAT,
+                "sample_rate": TTS_SAMPLE_RATE,
+                "speech_text": speech_text,
+            }
+        )
+    else:
+        yield sse_data_event(
+            {
+                "stage": "tts_audio_error",
+                "segment": segment,
+                "audio_index": audio_index,
+                "message": "streaming TTS failed or returned no audio",
+            }
+        )
+
+
 @router.post("/api/chatbox/text")
 async def chatbox_text(request: Request) -> JSONResponse:
     payload, error_response = await read_json_object(request)
@@ -109,6 +190,7 @@ async def chatbox_audio_stream(request: Request) -> StreamingResponse:
 
     async def event_stream():
         ack_queue: asyncio.Queue[str] = asyncio.Queue()
+        audio_index = 0
 
         async def on_ack(text: str) -> None:
             await ack_queue.put(text)
@@ -124,7 +206,16 @@ async def chatbox_audio_stream(request: Request) -> StreamingResponse:
             try:
                 ack_text = await asyncio.wait_for(ack_queue.get(), timeout=0.2)
                 ack_event: dict[str, Any] = {"stage": "ack", "speech_text": ack_text}
-                yield f"data: {json.dumps(ack_event, ensure_ascii=False)}\n\n"
+                yield sse_data_event(ack_event)
+                if should_synthesize:
+                    audio_index += 1
+                    async for tts_event in stream_speech_sse_events(
+                        model=model,
+                        text=ack_text,
+                        segment="ack",
+                        audio_index=audio_index,
+                    ):
+                        yield tts_event
             except asyncio.TimeoutError:
                 continue
 
@@ -136,23 +227,26 @@ async def chatbox_audio_stream(request: Request) -> StreamingResponse:
             await append_history(session_id, "assistant", agent_result.history_text)
             await update_plate_agent_state(session_id, agent_result.state)
 
-        audio_data_url = None
-        if should_synthesize:
-            audio_data_url = await speech_synthesizer.synthesize(
-                model=model, text=agent_result.speech_text
-            )
-
         result_event = {
             "stage": "result",
             "text": agent_result.text,
-            "audio_data_url": audio_data_url,
+            "audio_data_url": None,
             "history_text": agent_result.history_text,
             "speech_text": agent_result.speech_text,
             "output_is_json": True,
             "latency_ms": agent_result.latency_ms,
             "agent_state": agent_result.state.to_context(),
         }
-        yield f"data: {json.dumps(result_event, ensure_ascii=False)}\n\n"
+        yield sse_data_event(result_event)
+        if should_synthesize:
+            audio_index += 1
+            async for tts_event in stream_speech_sse_events(
+                model=model,
+                text=agent_result.speech_text,
+                segment="final",
+                audio_index=audio_index,
+            ):
+                yield tts_event
         yield "data: [DONE]\n\n"
 
     return StreamingResponse(event_stream(), media_type="text/event-stream")
@@ -331,6 +425,72 @@ async def synthesize_speech_audio(model: str, text: str | None) -> str | None:
     if not speech_text:
         return None
     return await speech_synthesizer.synthesize(model=model, text=speech_text)
+
+
+async def stream_speech_audio_events(
+    session: AudioSession,
+    *,
+    text: str,
+    segment: str,
+    audio_index: int,
+) -> bool:
+    speech_text = text.strip()
+    if not speech_text:
+        return False
+
+    await send_event(
+        session,
+        "tts_audio_start",
+        {
+            "segment": segment,
+            "audio_index": audio_index,
+            "format": TTS_STREAM_RESPONSE_FORMAT,
+            "sample_rate": TTS_SAMPLE_RATE,
+            "speech_text": speech_text,
+        },
+    )
+
+    async def on_chunk(chunk: bytes) -> None:
+        await send_event(
+            session,
+            "tts_audio_delta",
+            {
+                "segment": segment,
+                "audio_index": audio_index,
+                "format": TTS_STREAM_RESPONSE_FORMAT,
+                "sample_rate": TTS_SAMPLE_RATE,
+                "audio_base64": base64.b64encode(chunk).decode("ascii"),
+            },
+        )
+
+    ok = await speech_synthesizer.stream_synthesize(
+        model=session.model,
+        text=speech_text,
+        on_audio_chunk=on_chunk,
+    )
+    if ok:
+        await send_event(
+            session,
+            "tts_audio_end",
+            {
+                "segment": segment,
+                "audio_index": audio_index,
+                "format": TTS_STREAM_RESPONSE_FORMAT,
+                "sample_rate": TTS_SAMPLE_RATE,
+                "speech_text": speech_text,
+            },
+        )
+    else:
+        await send_event(
+            session,
+            "tts_audio_error",
+            {
+                "segment": segment,
+                "audio_index": audio_index,
+                "message": "streaming TTS failed or returned no audio",
+            },
+        )
+    return ok
 
 
 async def maybe_handle_easy_turn_stop(session: AudioSession) -> bool:
@@ -621,12 +781,47 @@ async def finalize_session(session: AudioSession) -> None:
     input_path = CAPTURE_DIR / f"{session.session_id}_input.wav"
     audio_transcoder.save_wav(wav, input_path)
 
+    tts_queue: asyncio.Queue[tuple[str, str, int] | None] = asyncio.Queue()
+    tts_worker_task: asyncio.Task | None = None
+    tts_index = 0
+
+    async def tts_worker() -> None:
+        while True:
+            item = await tts_queue.get()
+            try:
+                if item is None:
+                    return
+                segment, text, audio_index = item
+                await stream_speech_audio_events(
+                    session,
+                    text=text,
+                    segment=segment,
+                    audio_index=audio_index,
+                )
+            finally:
+                tts_queue.task_done()
+
+    async def enqueue_streaming_tts(segment: str, text: str) -> None:
+        nonlocal tts_index, tts_worker_task
+        if not session.output_audio or not session.stream_speech_audio:
+            return
+        tts_index += 1
+        if tts_worker_task is None:
+            tts_worker_task = asyncio.create_task(tts_worker())
+        await tts_queue.put((segment, text, tts_index))
+
     try:
         state = await get_plate_agent_state(session.chat_session_id) if session.chat_session_id else PlateAgentState()
         agent = get_plate_agent_service(model_gateway)
 
         async def on_ack(text: str) -> None:
-            audio_url = await synthesize_speech_audio(session.model, text) if session.output_audio else None
+            audio_url = None
+            if session.output_audio and session.stream_speech_audio:
+                await send_event(session, "processing_ack", {"speech_text": text, "audio_data_url": None})
+                await enqueue_streaming_tts("ack", text)
+                return
+            elif session.output_audio:
+                audio_url = await synthesize_speech_audio(session.model, text)
             await send_event(session, "processing_ack", {"speech_text": text, "audio_data_url": audio_url})
 
         agent_result = await agent.handle_audio_turn(
@@ -644,6 +839,10 @@ async def finalize_session(session: AudioSession) -> None:
                 "saved_input_wav": str(input_path),
             },
         )
+        if tts_worker_task is not None:
+            await tts_queue.put(None)
+            await tts_queue.join()
+            await tts_worker_task
         return
 
     user_history_text = ""
@@ -654,7 +853,9 @@ async def finalize_session(session: AudioSession) -> None:
         await append_history(session.chat_session_id, "assistant", agent_result.history_text)
         await update_plate_agent_state(session.chat_session_id, agent_result.state)
 
-    audio_data_url = await synthesize_speech_audio(session.model, agent_result.speech_text) if session.output_audio else None
+    audio_data_url = None
+    if session.output_audio and not session.stream_speech_audio:
+        audio_data_url = await synthesize_speech_audio(session.model, agent_result.speech_text)
     await send_event(
         session,
         "final_result",
@@ -673,3 +874,10 @@ async def finalize_session(session: AudioSession) -> None:
             "agent_state": agent_result.state.to_context(),
         },
     )
+    if session.output_audio and session.stream_speech_audio:
+        await enqueue_streaming_tts("final", agent_result.speech_text)
+        await tts_queue.join()
+        await tts_queue.put(None)
+        await tts_queue.join()
+        if tts_worker_task is not None:
+            await tts_worker_task

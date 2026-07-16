@@ -305,13 +305,17 @@ class PlateAgentService:
                 "confusions": [item.to_dict() for item in rule_confusions],
             },
         )
-        confusions = await self.detect_confusions(
-            model=model,
-            wav_bytes=wav_bytes,
-            car_plate=working.car_plate,
-            state=working,
-            rule_confusions=rule_confusions,
-        )
+        if rule_confusions:
+            working.confusions = rule_confusions
+            confusions = await self.detect_confusions(
+                model=model,
+                wav_bytes=wav_bytes,
+                car_plate=working.car_plate,
+                state=working,
+                rule_confusions=rule_confusions,
+            )
+        else:
+            confusions = []
         working.confusions = confusions
         assistant_reply = await self.generate_reply(model=model, state=working, changed=True)
         working.assistant_reply = assistant_reply
@@ -499,8 +503,14 @@ class PlateAgentService:
         state: PlateAgentState | None = None,
         rule_confusions: list[PlateConfusion] | None = None,
     ) -> list[PlateConfusion]:
+        plate = clean_plate_text(car_plate)
         current_context = {
-            "car_plate": clean_plate_text(car_plate),
+            "car_plate": plate,
+            "plate_chars": [
+                {"position": idx, "char": char}
+                for idx, char in enumerate(plate, start=1)
+            ],
+            "plate_length": len(plate),
             "vehicle_type": (state.vehicle_type if state else vehicle_type_by_length(car_plate)),
             "assistant_reply": state.assistant_reply if state else "",
         }
@@ -516,13 +526,16 @@ class PlateAgentService:
                 f"当前识别车牌：{car_plate}。"
                 f"当前识别状态：{json.dumps(current_context, ensure_ascii=False)}。"
                 f"当前候选混淆列表：{rule_confusions_context}。"
+                "只根据当前车牌号输出本轮 confusions，不要参考上一轮的 confusions、assistant_reply、历史纠错结果或之前的车牌。"
+                "当前识别车牌中的字符位置已经给出，必须以这些位置上的字符为准，不要自行新增不存在的字符或位置。"
                 "当前候选混淆列表来自固定规则扫描，表示当前新车牌里命中的潜在混淆字符。"
                 "不要参考上一轮旧的 confusions；不要把上一轮旧混淆点带入本轮结果。"
                 "处理顺序必须如下："
                 "第一步，只从当前候选混淆列表里判断哪些还需要用户二次确认。"
                 "如果用户最新音频已经明确确认了某个候选混淆点，就不要输出这个混淆点。"
+                "如果当前车牌号里没有这个候选混淆点，就不要凭历史结果或旧状态补出来。"
                 "如果用户最新音频没有明确确认某个候选混淆点，或者音频里仍然听起来不确定，就输出这个混淆点。"
-                "第二步，如果用户最新音频里还有其他明显不确定、发音含糊、背景噪声导致可能听错的位置，可以额外输出。"
+                "第二步，不要额外新增当前候选混淆列表之外的位置。"
                 "只要输出混淆点，每一个字符位置都必须单独输出一条 confusions 记录。"
                 "不能只返回第一个命中的位置，不能合并多个位置。"
                 "当前候选混淆列表的规则来源如下："
@@ -532,7 +545,7 @@ class PlateAgentService:
                 "4. 如果省份简称是 津 或 京，必须输出 position=1，candidates 必须包含 津 和 京，reason 说明车牌开头的省份简称当前识别为天津的津或北京的京，不能说第几位；"
                 "5. 如果省份简称是 桂 或 贵，必须输出 position=1，reason 说明车牌开头的省份简称当前识别为广西的桂或贵州的贵，不能说第几位；"
                 "6. 如果省份简称是 冀 或 吉，必须输出 position=1，reason 说明车牌开头的省份简称当前识别为河北的冀或吉林的吉，不能说第几位；"
-                "7. 其他语音中明显不确定、用户发音含糊、背景噪声导致可能听错的位置，也可以额外标记出来。"
+                "7. 当前候选混淆列表之外的位置一律不要输出。"
                 "只输出 JSON 对象，字段为 confusions。confusions 是数组，每一项包含 position、value、candidates、reason。"
                 "position 是给后端使用的数字位置；reason 是给用户确认的自然语言，不能出现“第几位”“第1位”“第2位”等绝对位置表达。"
                 "如果没有需要二次确认的易混淆字符，confusions 输出空数组。"
@@ -545,12 +558,17 @@ class PlateAgentService:
             log_node_output("detect_confusions", {"raw": result, "car_plate": car_plate, "confusions": []})
             return []
         items = [PlateConfusion.from_value(item) for item in raw_items]
-        confusions = with_relative_confusion_reasons(car_plate, [item for item in items if item is not None])
+        parsed_items = [item for item in items if item is not None]
+        allowed_positions = {item.position for item in (rule_confusions or [])}
+        if allowed_positions:
+            parsed_items = [item for item in parsed_items if item.position in allowed_positions]
+        confusions = with_relative_confusion_reasons(car_plate, parsed_items)
         log_node_output(
             "detect_confusions",
             {
                 "raw": result,
                 "car_plate": car_plate,
+                "current_context": current_context,
                 "rule_confusions": [item.to_dict() for item in (rule_confusions or [])],
                 "confusions": [item.to_dict() for item in confusions],
             },
@@ -604,7 +622,7 @@ class PlateAgentService:
 
 你正在更新一个已经识别过的车牌号，不是开始新的车牌识别任务。
 
-任务：当前车牌可能存在问题，请一定根据这一轮用户音频里的要求，对当前暂时识别到的车牌进行更改。
+任务：当前车牌存在问题，请一定根据这一轮用户音频里的要求，对当前暂时识别到的车牌进行更改。
 
 判断规则：
 1. 如果用户明确说某个位置、某个字符、前面的、后面的、开头、末尾不对，必须按用户这次音频修改当前车牌。
@@ -977,12 +995,19 @@ def with_relative_confusion_reasons(car_plate: str, confusions: list[PlateConfus
     plate = clean_plate_text(car_plate)
     normalized: list[PlateConfusion] = []
     for item in confusions:
+        value = item.value
+        index = item.position - 1
+        if 0 <= index < len(plate):
+            value = plate[index]
+        candidates = list(item.candidates)
+        if value and candidates and value not in candidates:
+            candidates.insert(0, value)
         normalized.append(
             PlateConfusion(
                 position=item.position,
-                value=item.value,
-                candidates=list(item.candidates),
-                reason=relative_confusion_reason(plate, item),
+                value=value,
+                candidates=candidates,
+                reason=relative_confusion_reason(plate, PlateConfusion(item.position, value, item.reason, candidates)),
             )
         )
     return normalized

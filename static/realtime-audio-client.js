@@ -70,11 +70,15 @@ export class RealtimeAudioClient extends EventTarget {
       interruptedAssistantText: "",
       interrupted: false,
       streamedAudioCount: 0,
+      streamSpeechAudio: false,
       streamingTextStarted: false,
       mode: "idle",
       timer: null,
       flushResolve: null,
       playbackContext: null,
+      pcmPlaybackTime: 0,
+      pcmSources: new Set(),
+      pcmStreamingCount: 0,
       playbackGeneration: 0,
       bargeInTriggered: false,
       preBufferChunks: null,
@@ -321,6 +325,7 @@ export class RealtimeAudioClient extends EventTarget {
     this.state.chunks = 0;
     this.state.prefillOk = 0;
     this.state.streamedAudioCount = 0;
+    this.state.streamSpeechAudio = false;
     this.state.streamingTextStarted = false;
     this.state.audioTextByIndex = new Map();
     this.state.playedAssistantText = "";
@@ -460,6 +465,13 @@ export class RealtimeAudioClient extends EventTarget {
       }
       this.state.currentAudio = null;
     }
+    for (const source of this.state.pcmSources) {
+      source.onended = null;
+      try { source.stop(); } catch (_err) { /* already stopped */ }
+    }
+    this.state.pcmSources.clear();
+    this.state.pcmPlaybackTime = 0;
+    this.state.pcmStreamingCount = 0;
     this.state.audioQueue = [];
     this.state.audioPlaying = false;
   }
@@ -470,6 +482,79 @@ export class RealtimeAudioClient extends EventTarget {
     this.state.audioTextByIndex.set(index, historyText || this.getDisplayedText());
     this.state.audioQueue.push({ url: audioDataUrl, index });
     if (!this.state.audioPlaying) this.playNextAudio();
+  }
+
+  handleTtsAudioStart(data) {
+    const index = Number(data.audio_index || this.state.streamedAudioCount + 1);
+    this.state.streamedAudioCount = Math.max(this.state.streamedAudioCount, index);
+    this.state.audioTextByIndex.set(index, data.speech_text || this.getDisplayedText());
+    this.state.pcmStreamingCount += 1;
+    this.state.audioPlaying = true;
+    this.setMode("speaking");
+    this.setVoiceState("正在播报中");
+  }
+
+  handleTtsAudioDelta(data) {
+    if (data.format !== "pcm" || !data.audio_base64) return;
+    const index = Number(data.audio_index || this.state.streamedAudioCount + 1);
+    this.enqueuePcmAudioChunk(data.audio_base64, Number(data.sample_rate || 24000), index);
+  }
+
+  handleTtsAudioEnd(data) {
+    const index = Number(data.audio_index || this.state.streamedAudioCount + 1);
+    if (data.speech_text) this.state.audioTextByIndex.set(index, data.speech_text);
+    this.state.pcmStreamingCount = Math.max(0, this.state.pcmStreamingCount - 1);
+    this.finishPcmPlaybackIfIdle();
+    if (data.segment === "final" && this.state.finalReceived) this.closeSocket(this.state.ws);
+  }
+
+  enqueuePcmAudioChunk(audioBase64, sampleRate, audioIndex) {
+    const context = this.ensurePlaybackContext();
+    if (context.state === "suspended") context.resume().catch((err) => this.log(`audio resume error: ${err.message || err}`, "error"));
+    const bytes = this.base64ToBytes(audioBase64);
+    const frameCount = Math.floor(bytes.byteLength / 2);
+    if (!frameCount) return;
+
+    const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+    const audioBuffer = context.createBuffer(1, frameCount, sampleRate);
+    const channel = audioBuffer.getChannelData(0);
+    for (let i = 0; i < frameCount; i += 1) {
+      channel[i] = Math.max(-1, Math.min(1, view.getInt16(i * 2, true) / 32768));
+    }
+
+    const source = context.createBufferSource();
+    source.buffer = audioBuffer;
+    source.connect(context.destination);
+    const generation = this.state.playbackGeneration;
+    const startAt = Math.max(context.currentTime + 0.02, this.state.pcmPlaybackTime || 0);
+    this.state.pcmPlaybackTime = startAt + audioBuffer.duration;
+    this.state.pcmSources.add(source);
+    this.state.currentAudio = source;
+    this.state.audioPlaying = true;
+    source.onended = () => {
+      this.state.pcmSources.delete(source);
+      if (this.state.currentAudio === source) this.state.currentAudio = null;
+      this.state.playedAssistantText =
+        this.state.audioTextByIndex.get(audioIndex) || this.state.playedAssistantText || this.getDisplayedText();
+      if (generation === this.state.playbackGeneration) this.finishPcmPlaybackIfIdle();
+    };
+    source.start(startAt);
+  }
+
+  finishPcmPlaybackIfIdle() {
+    if (this.state.pcmStreamingCount > 0 || this.state.pcmSources.size > 0) return;
+    if (this.state.audioQueue.length > 0) {
+      if (!this.state.audioPlaying) this.playNextAudio();
+      return;
+    }
+    this.state.audioPlaying = false;
+    this.state.currentAudio = null;
+    this.state.pcmPlaybackTime = 0;
+    if (this.state.finalReceived && !this.state.interrupted) {
+      if (this.options.shouldAutoStartOnVad()) this.clearPassiveBufferAndResetVad();
+      this.setMode("idle");
+    }
+    this.setVoiceState("播报完");
   }
 
   async playStandaloneAudio(audioDataUrl, historyText = "") {
@@ -485,6 +570,7 @@ export class RealtimeAudioClient extends EventTarget {
   playNextAudio() {
     const next = this.state.audioQueue.shift();
     if (!next) {
+      if (this.state.pcmStreamingCount > 0 || this.state.pcmSources.size > 0) return;
       // Keep persistent mic+VAD alive for next turn detection
       this.state.audioPlaying = false;
       this.state.currentAudio = null;
@@ -574,7 +660,16 @@ export class RealtimeAudioClient extends EventTarget {
     return response.arrayBuffer();
   }
 
-  hasPendingPlayback() { return this.state.audioPlaying || this.state.audioQueue.length > 0; }
+  base64ToBytes(value) {
+    const binary = atob(value);
+    const bytes = new Uint8Array(binary.length);
+    for (let i = 0; i < binary.length; i += 1) bytes[i] = binary.charCodeAt(i);
+    return bytes;
+  }
+
+  hasPendingPlayback() {
+    return this.state.audioPlaying || this.state.audioQueue.length > 0 || this.state.pcmSources.size > 0 || this.state.pcmStreamingCount > 0;
+  }
 
   // ═══════════════  Helpers  ═══════════════
 
@@ -619,6 +714,7 @@ export class RealtimeAudioClient extends EventTarget {
     switch (data.type) {
       case "ready": this.log(`session=${data.session_id}`); break;
       case "started":
+        this.state.streamSpeechAudio = Boolean(data.stream_speech_audio);
         this.log(`server started model=${data.model} api=${data.qwen_api_base} history=${data.history_messages || 0}`);
         break;
       case "chunk_received": this.log(`chunk ${data.chunk_index} received, duration=${data.duration_ms}ms`); break;
@@ -650,6 +746,19 @@ export class RealtimeAudioClient extends EventTarget {
           this.enqueueAudio(data.audio_data_url, -1, data.speech_text || "");
           if (this.state.mode === "finalizing") this.setMode("speaking");
         }
+        break;
+      case "tts_audio_start":
+        this.handleTtsAudioStart(data);
+        break;
+      case "tts_audio_delta":
+        this.handleTtsAudioDelta(data);
+        break;
+      case "tts_audio_end":
+        this.handleTtsAudioEnd(data);
+        break;
+      case "tts_audio_error":
+        this.log(`streaming tts error: ${data.message || ""}`, "error");
+        this.handleTtsAudioEnd(data);
         break;
       case "turn_incomplete": this.handleTurnIncomplete(data); break;
       case "turn_complete": this.log(`easyturn ${data.turn_state} latency=${data.latency_ms}ms`); break;
@@ -692,18 +801,20 @@ export class RealtimeAudioClient extends EventTarget {
     }
     if (data.audio_data_url) {
       this.enqueueAudio(data.audio_data_url, this.state.streamedAudioCount + 1, this.state.finalHistoryText);
-    } else if (this.state.streamedAudioCount === 0) {
+    } else if (!this.state.streamSpeechAudio && this.state.streamedAudioCount === 0) {
       this.setVoiceState("播报完");
       this.log("没有解析到音频输出。");
     }
-    if (this.hasPendingPlayback()) {
+    if (this.state.streamSpeechAudio) {
+      this.setVoiceState("等待播报");
+    } else if (this.hasPendingPlayback()) {
       this.setMode("speaking");
     } else {
       if (this.options.shouldAutoStartOnVad()) this.clearPassiveBufferAndResetVad();
       this.setMode("idle");
     }
     this.log(`final latency=${data.latency_ms}ms, audio_chunks=${data.audio_chunks || this.state.streamedAudioCount}, input=${data.saved_input_wav}`);
-    this.closeSocket(socket);
+    if (!this.state.streamSpeechAudio) this.closeSocket(socket);
   }
 
   handleTurnIncomplete(data) {

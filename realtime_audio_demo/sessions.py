@@ -28,6 +28,7 @@ class AudioSession:
     chunks: list[bytes] = field(default_factory=list)
     prefill_queue: asyncio.Queue[tuple[int, bytes]] = field(default_factory=asyncio.Queue)
     prefill_task: Optional[asyncio.Task] = None
+    send_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     vad: Any = None
     started_at: float = field(default_factory=time.time)
     stopped: bool = False

@@ -1,5 +1,6 @@
 import base64
 import logging
+from typing import Any, Callable
 
 import httpx
 
@@ -7,13 +8,39 @@ from realtime_audio_demo.config import (
     FINAL_MAX_TOKENS,
     TTS_API_BASE,
     TTS_MODEL,
+    TTS_REF_AUDIO,
+    TTS_REF_TEXT,
     TTS_RESPONSE_FORMAT,
+    TTS_STREAM_FORMAT,
+    TTS_STREAM_RESPONSE_FORMAT,
+    TTS_TASK_TYPE,
     TTS_VOICE,
 )
 from realtime_audio_demo.services.interfaces import ChatModel, SpeechSynthesizer
 from realtime_audio_demo.services.model_gateway import model_gateway
 
 logger = logging.getLogger("uvicorn.error")
+
+
+def build_tts_payload(*, model: str, text: str, response_format: str, stream: bool = False) -> dict[str, object]:
+    payload: dict[str, object] = {
+        "model": model,
+        "input": text,
+        "response_format": response_format,
+    }
+    if TTS_VOICE:
+        payload["voice"] = TTS_VOICE
+    if TTS_TASK_TYPE:
+        payload["task_type"] = TTS_TASK_TYPE
+    if TTS_REF_AUDIO:
+        payload["ref_audio"] = TTS_REF_AUDIO
+        payload.setdefault("task_type", "Base")
+    if TTS_REF_TEXT:
+        payload["ref_text"] = TTS_REF_TEXT
+    if stream:
+        payload["stream"] = True
+        payload["stream_format"] = TTS_STREAM_FORMAT
+    return payload
 
 
 class TtsApiSpeechSynthesizer(SpeechSynthesizer):
@@ -35,12 +62,7 @@ class TtsApiSpeechSynthesizer(SpeechSynthesizer):
 
     async def _request_tts(self, *, model: str, text: str) -> str | None:
         url = f"{self.api_base}/v1/audio/speech"
-        payload = {
-            "model": model,
-            "input": text,
-            "voice": TTS_VOICE,
-            "response_format": TTS_RESPONSE_FORMAT,
-        }
+        payload = build_tts_payload(model=model, text=text, response_format=TTS_RESPONSE_FORMAT)
 
         try:
             async with httpx.AsyncClient(timeout=httpx.Timeout(30.0, connect=10.0)) as client:
@@ -60,6 +82,45 @@ class TtsApiSpeechSynthesizer(SpeechSynthesizer):
 
         audio_b64 = base64.b64encode(wav_bytes).decode("ascii")
         return f"data:audio/{TTS_RESPONSE_FORMAT};base64,{audio_b64}"
+
+    async def stream_synthesize(
+        self,
+        *,
+        model: str,
+        text: str,
+        on_audio_chunk: Callable[[bytes], Any],
+    ) -> bool:
+        speech_text = text.strip()
+        if not speech_text:
+            return False
+        if not self.api_base:
+            logger.warning("TTS_API_BASE not configured, skipping streaming TTS")
+            return False
+
+        url = f"{self.api_base}/v1/audio/speech"
+        payload = build_tts_payload(
+            model=TTS_MODEL,
+            text=speech_text,
+            response_format=TTS_STREAM_RESPONSE_FORMAT,
+            stream=True,
+        )
+        sent = False
+        try:
+            async with httpx.AsyncClient(timeout=httpx.Timeout(60.0, connect=10.0)) as client:
+                async with client.stream("POST", url, json=payload) as response:
+                    if response.status_code >= 400:
+                        body = await response.aread()
+                        logger.error("streaming TTS error: status=%d body=%s", response.status_code, body[:500])
+                        return False
+                    async for chunk in response.aiter_bytes():
+                        if not chunk:
+                            continue
+                        await on_audio_chunk(chunk)
+                        sent = True
+        except Exception as exc:
+            logger.error("streaming TTS request failed: %s", exc)
+            return False
+        return sent
 
 
 class ModelSpeechSynthesizer(SpeechSynthesizer):
@@ -85,6 +146,15 @@ class ModelSpeechSynthesizer(SpeechSynthesizer):
             return None
         audio_data_url = result.get("audio_data_url")
         return str(audio_data_url) if audio_data_url else None
+
+    async def stream_synthesize(
+        self,
+        *,
+        model: str,
+        text: str,
+        on_audio_chunk: Callable[[bytes], Any],
+    ) -> bool:
+        return False
 
 
 def create_speech_synthesizer() -> SpeechSynthesizer:
