@@ -22,6 +22,8 @@ CONFIRMATION_NO_ACK = "嗯嗯，目前的车牌信息有错误，我新写的一
 
 CAR_PLATE_EXTRACTION_PROMPT_PATH = Path(__file__).resolve().parents[1] / "car_plate_extraction_prompt.md"
 CAR_PLATE_EXTRACTION_PROMPT = CAR_PLATE_EXTRACTION_PROMPT_PATH.read_text(encoding="utf-8").strip()
+CAR_PLATE_UPDATE_PROMPT_PATH = Path(__file__).resolve().parents[1] / "car_plate_update_prompt.md"
+CAR_PLATE_UPDATE_PROMPT = CAR_PLATE_UPDATE_PROMPT_PATH.read_text(encoding="utf-8").strip()
 PRONUNCIATION_RULES_PROMPT = """
 ### pronunciation 重点规则
 
@@ -38,7 +40,7 @@ PRONUNCIATION_RULES_PROMPT = """
 | `J` | 勾、沟儿 | 用户报车牌时可能用“勾”或“沟儿”表示字母 J |
 | `Q` | 圈 | 用户报车牌时可能用“圈”表示字母 Q |
 
-car_plate 只能包含省份简称、英文字母、数字，不能包含洞、幺、是、陆、拐、吸、勾、沟儿、圈。
+car_plate 只能包含省份简称、英文字母、数字，以及明确的特殊车牌尾字警、临、学、领、挂；不能包含洞、幺、是、陆、拐、吸、勾、沟儿、圈这些读音汉字。
 """
 
 
@@ -424,71 +426,30 @@ class PlateAgentService:
             model=model,
             wav_bytes=wav_bytes,
             prompt=f"{CAR_PLATE_EXTRACTION_PROMPT}\n\n{PRONUNCIATION_RULES_PROMPT}",
-            max_tokens=128,
+            max_tokens=512,
         )
-        extraction_plate = clean_plate_text(parse_json_object(extraction_result).get("car_plate"))
-        log_node_output("extract_car_plate.step1_extract_with_pronunciation", {"raw": extraction_result, "car_plate": extraction_plate})
-
-        suffix_result = await self.audio_call(
-            model=model,
-            wav_bytes=wav_bytes,
-            prompt=f"""
-任务：复核用户音频中的车牌末尾是否包含特殊车牌尾字，并修正第一步识别结果。只输出 JSON 对象，字段为 car_plate。
-第一步识别结果：{extraction_plate}
-
-这一步只重点检查车牌最后一位。用户的车牌末尾可能不是数字或字母，而是特殊车牌尾字。
-
-### 特殊车牌尾字
-
-| 尾字 | 含义 |
-|------|------|
-| 警 | 警车 |
-| 临 | 临时车牌 |
-| 学 | 教练车 |
-| 领 | 领事馆车牌 |
-| 挂 | 半挂车牌 |
-
-如果音频里明确说了这些特殊尾字，car_plate 末尾要保留对应汉字。
-如果音频里没有明确特殊尾字，就保持第一步识别结果。
-
-### 临字重点规则
-
-“临”是临时车牌尾字，语音里可能被听成“零”“0”“洞”“林”“拎”“令”。
-如果用户是在车牌末尾说“临”“临牌”“临时牌”“临时车牌”，或者末尾发音明显接近“临”，必须把 car_plate 最后一位改成“临”，不要输出 0。
-如果用户明确是在报数字“零”或“洞”，并且不是临时车牌语义，才保留数字 0。
-
-### 示例
-
-第一步识别结果：粤B12340
-音频末尾说的是：粤 B 一二三四 临
-输出：{{"car_plate":"粤B1234临"}}
-
-第一步识别结果：京A88880
-音频末尾说的是：京 A 八八八八 临牌
-输出：{{"car_plate":"京A8888临"}}
-
-第一步识别结果：沪C12340
-音频末尾说的是：沪 C 一二三四 洞
-输出：{{"car_plate":"沪C12340"}}
-""",
-            max_tokens=128,
+        summarized_plate = extract_final_plate_from_text(extraction_result)
+        parsed_plate = clean_plate_text(parse_json_object(extraction_result).get("car_plate"))
+        extraction_plate = summarized_plate or parsed_plate
+        log_node_output(
+            "extract_car_plate.step1_extract_with_pronunciation",
+            {
+                "raw": extraction_result,
+                "summary_car_plate": summarized_plate,
+                "json_car_plate": parsed_plate,
+                "car_plate": extraction_plate,
+            },
         )
-        suffix_plate = clean_plate_text(parse_json_object(suffix_result).get("car_plate")) or extraction_plate
         final_plate = await self.normalize_plate_result(
             model=model,
             wav_bytes=wav_bytes,
-            car_plate=suffix_plate,
+            car_plate=extraction_plate,
             node="extract_car_plate.normalize",
-        )
-        log_node_output(
-            "extract_car_plate.step3_special_suffix",
-            {"raw": suffix_result, "previous_car_plate": extraction_plate, "car_plate": final_plate},
         )
         log_node_output(
             "extract_car_plate",
             {
                 "step1_car_plate": extraction_plate,
-                "step3_car_plate": suffix_plate,
                 "car_plate": final_plate,
             },
         )
@@ -616,101 +577,41 @@ class PlateAgentService:
         base_result = await self.audio_call(
             model=model,
             wav_bytes=wav_bytes,
-            prompt=f"""{CAR_PLATE_EXTRACTION_PROMPT}
+            prompt=f"""{CAR_PLATE_UPDATE_PROMPT}
 
 {PRONUNCIATION_RULES_PROMPT}
 
-你正在更新一个已经识别过的车牌号，不是开始新的车牌识别任务。
-
-任务：当前车牌存在问题，请一定根据这一轮用户音频里的要求，对当前暂时识别到的车牌进行更改。
-
-判断规则：
-1. 如果用户明确说某个位置、某个字符、前面的、后面的、开头、末尾不对，必须按用户这次音频修改当前车牌。
-2. 如果用户只是修正一个字符，只替换这个字符，并保留其他已经识别好的字符。
-3. 如果用户补充缺失字符，把补充内容合并到当前车牌中，输出完整的新 car_plate。
-4. 如果用户重新报了完整车牌，以用户这次音频为准输出完整的新 car_plate。
-5. 如果用户只是确认上一轮 AI 询问的某个混淆点正确，不要把车牌改错，保持当前 car_plate。
-6. 如果用户这次没有提供任何可用于修改车牌的新信息，输出当前暂时识别到的车牌。
-7. 必须保持车牌长度不变。除非用户明确说了"删除"或"去掉"这样的意思，否则不能减少车牌号中的字符数量。如果用户说某个字符不对，应该用正确字符替换它，而不是直接删掉。
-
-输出要求：
-只输出 JSON 对象，不要解释，不要 Markdown，不要输出用户原话。
-格式必须是：
-{{"car_plate":"..."}}
-
+当前识别状态：{update_context}
 当前暂时识别到的车牌：{state.car_plate}
 上一轮 AI 回复给用户的内容：{state.assistant_reply}
 这一轮用户输入：本次请求随带的用户音频。
 """,
-            max_tokens=128,
+            max_tokens=512,
         )
-        base_plate = clean_plate_text(parse_json_object(base_result).get("car_plate")) or state.car_plate
+        summarized_plate = extract_final_plate_from_text(base_result)
+        parsed_plate = clean_plate_text(parse_json_object(base_result).get("car_plate"))
+        base_plate = summarized_plate or parsed_plate or state.car_plate
         log_node_output(
             "update_car_plate.step1_update_with_pronunciation",
-            {"raw": base_result, "previous_state": state.to_context(), "car_plate": base_plate},
+            {
+                "raw": base_result,
+                "previous_state": state.to_context(),
+                "summary_car_plate": summarized_plate,
+                "json_car_plate": parsed_plate,
+                "car_plate": base_plate,
+            },
         )
 
-        suffix_result = await self.audio_call(
-            model=model,
-            wav_bytes=wav_bytes,
-            prompt=f"""
-任务：复核用户最新音频中的车牌末尾是否包含特殊车牌尾字，并修正第一步更新结果。只输出 JSON 对象，字段为 car_plate。
-当前识别状态：{json.dumps(state.to_context(), ensure_ascii=False)}。
-第一步更新结果：{base_plate}
-
-这一步只重点检查车牌最后一位。用户的车牌末尾可能不是数字或字母，而是特殊车牌尾字。
-
-### 特殊车牌尾字
-
-| 尾字 | 含义 |
-|------|------|
-| 警 | 警车 |
-| 临 | 临时车牌 |
-| 学 | 教练车 |
-| 领 | 领事馆车牌 |
-| 挂 | 半挂车牌 |
-
-如果用户最新音频里明确说了这些特殊尾字，car_plate 末尾要保留对应汉字。
-如果用户最新音频里没有明确特殊尾字，就保持第一步更新结果。
-
-### 临字重点规则
-
-“临”是临时车牌尾字，语音里可能被听成“零”“0”“洞”“林”“拎”“令”。
-如果用户是在车牌末尾说“临”“临牌”“临时牌”“临时车牌”，或者末尾发音明显接近“临”，必须把 car_plate 最后一位改成“临”，不要输出 0。
-如果用户明确是在报数字“零”或“洞”，并且不是临时车牌语义，才保留数字 0。
-
-### 示例
-
-第一步更新结果：粤B12340
-用户最新音频末尾说的是：粤 B 一二三四 临
-输出：{{"car_plate":"粤B1234临"}}
-
-第一步更新结果：京A88880
-用户最新音频末尾说的是：京 A 八八八八 临牌
-输出：{{"car_plate":"京A8888临"}}
-
-第一步更新结果：沪C12340
-用户最新音频末尾说的是：沪 C 一二三四 洞
-输出：{{"car_plate":"沪C12340"}}
-""",
-            max_tokens=128,
-        )
-        suffix_plate = clean_plate_text(parse_json_object(suffix_result).get("car_plate")) or base_plate
         car_plate = await self.normalize_plate_result(
             model=model,
             wav_bytes=wav_bytes,
-            car_plate=suffix_plate,
+            car_plate=base_plate,
             node="update_car_plate.normalize",
-        )
-        log_node_output(
-            "update_car_plate.step3_special_suffix",
-            {"raw": suffix_result, "previous_car_plate": base_plate, "step3_car_plate": suffix_plate, "car_plate": car_plate},
         )
         log_node_output(
             "update_car_plate",
             {
                 "step1_car_plate": base_plate,
-                "step3_car_plate": car_plate,
                 "car_plate": car_plate,
                 "previous_state": state.to_context(),
             },
@@ -875,6 +776,14 @@ def parse_json_object(text: Any) -> dict[str, Any]:
     except json.JSONDecodeError:
         return {}
     return value if isinstance(value, dict) else {}
+
+
+def extract_final_plate_from_text(text: Any) -> str:
+    raw = str(text or "")
+    matches = re.findall(r"^最终车牌[:：]\s*(.+)$", raw, flags=re.MULTILINE)
+    if not matches:
+        return ""
+    return clean_plate_text(matches[-1])
 
 
 def parse_bool_text(text: str, *, default: bool) -> bool:

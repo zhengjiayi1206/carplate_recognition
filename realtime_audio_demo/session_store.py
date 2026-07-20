@@ -7,6 +7,7 @@ from typing import Any
 
 from realtime_audio_demo.config import MAX_HISTORY_TURNS, SESSION_TTL
 from realtime_audio_demo.services.plate_agent import PlateAgentState, clone_state
+from realtime_audio_demo.utils.audio import wav_bytes_list_to_wav_bytes, wav_bytes_to_float_samples
 
 logger = logging.getLogger("uvicorn.error")
 
@@ -16,6 +17,7 @@ class ChatSession:
     session_id: str
     history: list[dict[str, Any]] = field(default_factory=list)
     plate_state: PlateAgentState = field(default_factory=PlateAgentState)
+    plate_audio_turns: list[bytes] = field(default_factory=list)
     created_at: float = field(default_factory=time.time)
     last_access: float = field(default_factory=time.time)
 
@@ -96,6 +98,57 @@ async def get_plate_agent_state(session_id: str) -> PlateAgentState:
         return clone_state(session.plate_state)
 
 
+async def get_plate_audio_turns(session_id: str) -> list[bytes]:
+    async with _lock:
+        session = _sessions.get(session_id)
+        if session is None:
+            session = ChatSession(session_id=session_id)
+            _sessions[session_id] = session
+            logger.info("session %s created", session_id)
+        session.last_access = time.time()
+        return list(session.plate_audio_turns)
+
+
+async def append_plate_audio_turn(session_id: str, wav_bytes: bytes) -> None:
+    async with _lock:
+        session = _sessions.get(session_id)
+        if session is None:
+            session = ChatSession(session_id=session_id)
+            _sessions[session_id] = session
+            logger.info("session %s created", session_id)
+        session.plate_audio_turns.append(wav_bytes)
+        session.plate_audio_turns = session.plate_audio_turns[-4:]
+        session.last_access = time.time()
+
+
+async def clear_plate_audio_turns(session_id: str) -> None:
+    async with _lock:
+        session = _sessions.get(session_id)
+        if session is None:
+            session = ChatSession(session_id=session_id)
+            _sessions[session_id] = session
+            logger.info("session %s created", session_id)
+        session.plate_audio_turns = []
+        session.last_access = time.time()
+
+
+async def build_plate_audio_input(
+    session_id: str,
+    turn_wav_bytes: bytes,
+    *,
+    has_plate: bool,
+    target_rate: int | None = None,
+) -> bytes:
+    if has_plate:
+        return turn_wav_bytes
+    prior_turns = await get_plate_audio_turns(session_id)
+    if not prior_turns:
+        return turn_wav_bytes
+    if target_rate is None:
+        _, target_rate = wav_bytes_to_float_samples(turn_wav_bytes)
+    return wav_bytes_list_to_wav_bytes([*prior_turns, turn_wav_bytes], target_rate)
+
+
 async def update_plate_agent_state(session_id: str, state: PlateAgentState) -> None:
     async with _lock:
         session = _sessions.get(session_id)
@@ -116,6 +169,7 @@ async def reset_session_state(session_id: str) -> None:
             logger.info("session %s created", session_id)
         session.history = []
         session.plate_state = PlateAgentState()
+        session.plate_audio_turns = []
         session.last_access = time.time()
 
 

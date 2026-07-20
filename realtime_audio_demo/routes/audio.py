@@ -40,7 +40,10 @@ from realtime_audio_demo.services.silero_vad import SileroVadConfig, SileroVadSe
 from realtime_audio_demo.services.turn_taking import easy_turn_detector
 from realtime_audio_demo.session_store import (
     append_audio_history,
+    append_plate_audio_turn,
     append_history,
+    build_plate_audio_input,
+    clear_plate_audio_turns,
     get_plate_agent_state,
     get_session_history,
     update_plate_agent_state,
@@ -185,6 +188,14 @@ async def chatbox_audio_stream(request: Request) -> StreamingResponse:
     model = normalize_model_name(payload.get("model") or QWEN_MODEL)
     session_id = str(payload.get("session_id") or "").strip()
     state = await get_plate_agent_state(session_id) if session_id else PlateAgentState()
+    turn_wav_bytes = wav_bytes
+    input_wav_bytes = wav_bytes
+    if session_id:
+        input_wav_bytes = await build_plate_audio_input(
+            session_id,
+            turn_wav_bytes,
+            has_plate=state.has_car_plate,
+        )
     agent = get_plate_agent_service(model_gateway)
     should_synthesize = bool(payload.get("outputAudio"))
 
@@ -197,7 +208,7 @@ async def chatbox_audio_stream(request: Request) -> StreamingResponse:
 
         agent_task = asyncio.create_task(
             agent.handle_audio_turn(
-                model=model, wav_bytes=wav_bytes, state=state, on_ack=on_ack,
+                model=model, wav_bytes=input_wav_bytes, state=state, on_ack=on_ack,
             )
         )
 
@@ -223,9 +234,14 @@ async def chatbox_audio_stream(request: Request) -> StreamingResponse:
 
         # Persist state
         if session_id:
-            await append_audio_history(session_id, wav_bytes)
+            await append_audio_history(session_id, turn_wav_bytes)
             await append_history(session_id, "assistant", agent_result.history_text)
             await update_plate_agent_state(session_id, agent_result.state)
+            if not state.has_car_plate:
+                if agent_result.state.has_car_plate:
+                    await clear_plate_audio_turns(session_id)
+                else:
+                    await append_plate_audio_turn(session_id, turn_wav_bytes)
 
         result_event = {
             "stage": "result",
@@ -777,9 +793,7 @@ async def finalize_session(session: AudioSession) -> None:
         await send_event(session, "error", {"message": "no audio chunks received"})
         return
 
-    wav = audio_transcoder.float32_chunks_to_wav(session.chunks, session.source_sample_rate, session.target_sample_rate)
-    input_path = CAPTURE_DIR / f"{session.session_id}_input.wav"
-    audio_transcoder.save_wav(wav, input_path)
+    turn_wav = audio_transcoder.float32_chunks_to_wav(session.chunks, session.source_sample_rate, session.target_sample_rate)
 
     tts_queue: asyncio.Queue[tuple[str, str, int] | None] = asyncio.Queue()
     tts_worker_task: asyncio.Task | None = None
@@ -812,6 +826,16 @@ async def finalize_session(session: AudioSession) -> None:
 
     try:
         state = await get_plate_agent_state(session.chat_session_id) if session.chat_session_id else PlateAgentState()
+        input_wav = turn_wav
+        if session.chat_session_id:
+            input_wav = await build_plate_audio_input(
+                session.chat_session_id,
+                turn_wav,
+                has_plate=state.has_car_plate,
+                target_rate=session.target_sample_rate,
+            )
+        input_path = CAPTURE_DIR / f"{session.session_id}_input.wav"
+        audio_transcoder.save_wav(input_wav, input_path)
         agent = get_plate_agent_service(model_gateway)
 
         async def on_ack(text: str) -> None:
@@ -826,7 +850,7 @@ async def finalize_session(session: AudioSession) -> None:
 
         agent_result = await agent.handle_audio_turn(
             model=session.model,
-            wav_bytes=wav,
+            wav_bytes=input_wav,
             state=state,
             on_ack=on_ack,
         )
@@ -836,7 +860,7 @@ async def finalize_session(session: AudioSession) -> None:
             "final_error",
             {
                 "message": str(exc),
-                "saved_input_wav": str(input_path),
+                "saved_input_wav": str(input_path) if "input_path" in locals() else "",
             },
         )
         if tts_worker_task is not None:
@@ -849,9 +873,14 @@ async def finalize_session(session: AudioSession) -> None:
 
     # Append to session history
     if session.chat_session_id:
-        await append_audio_history(session.chat_session_id, wav)
+        await append_audio_history(session.chat_session_id, turn_wav)
         await append_history(session.chat_session_id, "assistant", agent_result.history_text)
         await update_plate_agent_state(session.chat_session_id, agent_result.state)
+        if not state.has_car_plate:
+            if agent_result.state.has_car_plate:
+                await clear_plate_audio_turns(session.chat_session_id)
+            else:
+                await append_plate_audio_turn(session.chat_session_id, turn_wav)
 
     audio_data_url = None
     if session.output_audio and not session.stream_speech_audio:

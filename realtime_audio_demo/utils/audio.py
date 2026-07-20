@@ -18,12 +18,43 @@ def wav_bytes_from_float32_chunks(chunks: list[bytes], source_rate: int, target_
     return pcm_float_to_wav_bytes(samples, target_rate)
 
 
+def wav_bytes_list_to_wav_bytes(chunks: list[bytes], target_rate: int) -> bytes:
+    samples: list[float] = []
+    for wav_bytes in chunks:
+        wav_samples, source_rate = wav_bytes_to_float_samples(wav_bytes)
+        if source_rate != target_rate:
+            wav_samples = resample_linear(wav_samples, source_rate, target_rate)
+        samples.extend(wav_samples)
+    return pcm_float_to_wav_bytes(samples, target_rate)
+
+
 def float32_bytes_to_list(data: bytes) -> list[float]:
     arr = array("f")
     arr.frombytes(data[: len(data) - (len(data) % 4)])
     if sys.byteorder != "little":
         arr.byteswap()
     return arr.tolist()
+
+
+def wav_bytes_to_float_samples(wav_bytes: bytes) -> tuple[list[float], int]:
+    with wave.open(BytesIO(wav_bytes), "rb") as wf:
+        channels = wf.getnchannels()
+        sample_width = wf.getsampwidth()
+        sample_rate = wf.getframerate()
+        frame_count = wf.getnframes()
+        frames = wf.readframes(frame_count)
+
+    if sample_width != 2:
+        raise ValueError(f"unsupported wav sample width: {sample_width}")
+    if channels != 1:
+        raise ValueError(f"unsupported wav channels: {channels}")
+
+    pcm = array("h")
+    pcm.frombytes(frames[: len(frames) - (len(frames) % 2)])
+    if sys.byteorder != "little":
+        pcm.byteswap()
+    samples = [max(-1.0, min(1.0, sample / 32768.0)) for sample in pcm]
+    return samples, sample_rate
 
 
 def resample_linear(samples: list[float], source_rate: int, target_rate: int) -> list[float]:
@@ -55,4 +86,3 @@ def pcm_float_to_wav_bytes(samples: list[float], sample_rate: int) -> bytes:
         wf.setframerate(sample_rate)
         wf.writeframes(bytes(frames))
     return buf.getvalue()
-

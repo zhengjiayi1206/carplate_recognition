@@ -62,6 +62,19 @@ def extract_json_candidate(text: str) -> str:
     fenced = re.search(r"```(?:json|JSON)?\s*(.*?)\s*```", stripped, flags=re.DOTALL)
     if fenced:
         return fenced.group(1).strip()
+    if stripped.startswith(("{", "[")):
+        return stripped
+    decoder = json.JSONDecoder()
+    candidates: list[str] = []
+    for match in re.finditer(r"[\{\[]", stripped):
+        start = match.start()
+        try:
+            _, end = decoder.raw_decode(stripped[start:])
+        except json.JSONDecodeError:
+            continue
+        candidates.append(stripped[start : start + end].strip())
+    if candidates:
+        return candidates[-1]
     return stripped
 
 
