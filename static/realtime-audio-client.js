@@ -788,10 +788,11 @@ export class RealtimeAudioClient extends EventTarget {
     const userDisplayText = typeof data.user_display_text === "string" ? data.user_display_text.trim() : "";
     if (userDisplayText) this.emit("userTranscript", { text: userDisplayText });
     const currentText = this.getDisplayedText();
-    if (data.text) {
-      this.state.finalText = data.text;
-      this.state.finalHistoryText = typeof data.history_text === "string" ? data.history_text : data.text;
-      this.emit("result", { text: data.text, replace: true, _newBubble: true });
+    const displayText = data.speech_text || data.text || "";
+    if (displayText) {
+      this.state.finalText = displayText;
+      this.state.finalHistoryText = typeof data.history_text === "string" ? data.history_text : displayText;
+      this.emit("result", { text: displayText, replace: true, _newBubble: true });
     } else if (!this.state.streamingTextStarted) {
       this.emit("result", { text: "服务端没有返回文本。", replace: true, _newBubble: true });
       this.state.finalText = ""; this.state.finalHistoryText = "";

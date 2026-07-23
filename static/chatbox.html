@@ -637,6 +637,7 @@
       let modelName = "";
       let currentMode = "idle";
       let assistantBubble = null;
+      let stageFeedbackShown = false;
       let textBusy = false;
       let textAudio = null;
       let autoConversation = false;
@@ -798,25 +799,40 @@
         if (currentMode === "recording" || currentMode === "busy") {
           appendBubble("user", "语音输入中...");
           assistantBubble = null;
+          stageFeedbackShown = false;
         }
       });
 
       client.on("ack", ({ text, audio_url }) => {
         const ackText = text || "";
-        if (
+        if (!ackText) return;
+        const canReplacePlaceholder =
           assistantBubble &&
-          ["正在推理。", "判断是否说完。", "正在生成..."].includes(assistantBubble.textContent)
-        ) {
+          !stageFeedbackShown &&
+          ["正在推理。", "判断是否说完。", "正在生成..."].includes(assistantBubble.textContent);
+        if (canReplacePlaceholder) {
           assistantBubble.classList.remove("loading");
           assistantBubble.textContent = ackText;
         } else {
           assistantBubble = appendBubble("assistant", ackText);
         }
+        stageFeedbackShown = true;
         scrollToBottom();
       });
 
       client.on("result", ({ text, append, replace, loading, _newBubble }) => {
-        if (_newBubble) assistantBubble = null;
+        if (_newBubble) {
+          const lastAssistant = lastBubble("assistant");
+          if (stageFeedbackShown && lastAssistant && lastAssistant.textContent === (text || "")) {
+            assistantBubble = lastAssistant;
+            assistantBubble.classList.remove("loading");
+            stageFeedbackShown = false;
+            scrollToBottom();
+            return;
+          }
+          assistantBubble = null;
+          stageFeedbackShown = false;
+        }
         if (replace && text === "录音中。") {
           const lastUser = lastBubble("user");
           if (lastUser) lastUser.textContent = "语音输入中...";
@@ -1034,6 +1050,7 @@
       function clearConversation() {
         autoConversation = false;
         startInFlight = false;
+        stageFeedbackShown = false;
         stopTextAudio();
         client.stopPlayback();
         client.stopBargeInMonitor();
@@ -1047,6 +1064,7 @@
       }
 
       function resetConversationForRoutedSession(userText) {
+        stageFeedbackShown = false;
         els.conversation.innerHTML = "";
         appendBubble("user", userText);
         assistantBubble = appendBubble("assistant", "正在生成...");
@@ -1157,6 +1175,7 @@
 
       async function startAssistantSession() {
         setStatus("AI 开场中", true);
+        stageFeedbackShown = false;
         assistantBubble = appendBubble("assistant", "正在生成...");
         assistantBubble.classList.add("loading");
         const response = await fetch("/api/chatbox/session/start", {
