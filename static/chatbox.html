@@ -813,6 +813,9 @@
         if (canReplacePlaceholder) {
           assistantBubble.classList.remove("loading");
           assistantBubble.textContent = ackText;
+        } else if (assistantBubble && stageFeedbackShown) {
+          assistantBubble.classList.remove("loading");
+          assistantBubble.textContent += ackText;
         } else {
           assistantBubble = appendBubble("assistant", ackText);
         }
@@ -823,7 +826,7 @@
       client.on("result", ({ text, append, replace, loading, _newBubble }) => {
         if (_newBubble) {
           const lastAssistant = lastBubble("assistant");
-          if (stageFeedbackShown && lastAssistant && lastAssistant.textContent === (text || "")) {
+          if (stageFeedbackShown && lastAssistant) {
             assistantBubble = lastAssistant;
             assistantBubble.classList.remove("loading");
             stageFeedbackShown = false;

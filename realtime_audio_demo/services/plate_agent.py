@@ -17,6 +17,8 @@ from realtime_audio_demo.services.qwen import extract_stream_delta
 
 logger = logging.getLogger("uvicorn.error")
 
+PLATE_AGENT_RUNTIME_VERSION = "delta_ack_chunk_v3"
+
 PROVINCE_ABBREVIATIONS = {
     "京", "津", "冀", "晋", "蒙", "辽", "吉", "黑", "沪", "苏", "浙", "皖", "闽",
     "赣", "鲁", "豫", "鄂", "湘", "粤", "桂", "琼", "渝", "川", "贵", "云", "藏",
@@ -25,6 +27,8 @@ PROVINCE_ABBREVIATIONS = {
 
 CAR_PLATE_EXTRACTION_PROMPT_PATH = Path(__file__).resolve().parents[1] / "car_plate_extraction_prompt.md"
 CAR_PLATE_UPDATE_PROMPT_PATH = Path(__file__).resolve().parents[1] / "car_plate_update_prompt.md"
+TEMP_FEEDBACK_START_TAG = "【临时反馈】"
+TEMP_FEEDBACK_END_TAG = "【/临时反馈】"
 INITIAL_EXTRACT_RUNTIME_INSTRUCTION = (
     "重要输出约束：本轮是首轮车牌识别。"
     "每一段阶段性用户反馈都必须使用完整闭合标签："
@@ -89,6 +93,7 @@ class PlateAgentState:
 
     def to_context(self) -> dict[str, Any]:
         return {
+            "plate_agent_runtime": PLATE_AGENT_RUNTIME_VERSION,
             "car_plate": self.car_plate,
             "vehicle_type": self.vehicle_type,
             "confusions": clone_confusions(self.confusions),
@@ -183,15 +188,13 @@ class PlateAgentService:
             )
 
         attempts: list[dict[str, Any]] = []
-        emitted_feedbacks: set[str] = set()
         had_existing_plate = working.has_car_plate
         previous_car_plate = working.car_plate
 
         async def emit_new_feedback(feedback: str) -> None:
-            cleaned = str(feedback or "").strip()
-            if not cleaned or cleaned in emitted_feedbacks:
+            cleaned = str(feedback or "")
+            if not cleaned:
                 return
-            emitted_feedbacks.add(cleaned)
             await maybe_call_text_callback(on_ack, cleaned)
 
         raw, streamed_feedbacks = await self.stream_extract_plate_prompt_raw(
@@ -386,7 +389,23 @@ class PlateAgentService:
         )
         raw_parts: list[str] = []
         streamed_feedbacks: list[str] = []
-        emitted_count = 0
+        feedback_buffer = ""
+        in_feedback = False
+        current_feedback = ""
+
+        async def emit_feedback_delta(text: str) -> None:
+            if not text:
+                return
+            if on_feedback is not None:
+                await maybe_call_text_callback(on_feedback, text)
+
+        async def append_feedback_text(text: str) -> None:
+            nonlocal current_feedback
+            if not text:
+                return
+            current_feedback += text
+            await emit_feedback_delta(text)
+
         try:
             while True:
                 if stream_task.done() and queue.empty():
@@ -400,16 +419,40 @@ class PlateAgentService:
                     delta = extract_stream_delta(item.get("data") or {}).get("text") or ""
                     if delta:
                         raw_parts.append(delta)
-                        current_raw = "".join(raw_parts)
-                        matches = re.findall(r"【临时反馈】(.*?)【/临时反馈】", current_raw, flags=re.S)
-                        while emitted_count < len(matches):
-                            feedback = str(matches[emitted_count]).strip()
-                            emitted_count += 1
-                            if not feedback:
+                        feedback_buffer += delta
+                        while feedback_buffer:
+                            if in_feedback:
+                                end_index = feedback_buffer.find(TEMP_FEEDBACK_END_TAG)
+                                if end_index >= 0:
+                                    await append_feedback_text(feedback_buffer[:end_index])
+                                    feedback = current_feedback.strip()
+                                    if feedback:
+                                        streamed_feedbacks.append(feedback)
+                                    feedback_buffer = feedback_buffer[end_index + len(TEMP_FEEDBACK_END_TAG):]
+                                    in_feedback = False
+                                    current_feedback = ""
+                                    continue
+
+                                safe_text, feedback_buffer = split_before_partial_tag(
+                                    feedback_buffer,
+                                    TEMP_FEEDBACK_END_TAG,
+                                )
+                                if safe_text:
+                                    await append_feedback_text(safe_text)
+                                break
+
+                            start_index = feedback_buffer.find(TEMP_FEEDBACK_START_TAG)
+                            if start_index >= 0:
+                                feedback_buffer = feedback_buffer[start_index + len(TEMP_FEEDBACK_START_TAG):]
+                                in_feedback = True
+                                current_feedback = ""
                                 continue
-                            streamed_feedbacks.append(feedback)
-                            if on_feedback is not None:
-                                await maybe_call_text_callback(on_feedback, feedback)
+
+                            _, feedback_buffer = split_before_partial_tag(
+                                feedback_buffer,
+                                TEMP_FEEDBACK_START_TAG,
+                            )
+                            break
                 elif item_type == "error":
                     message = str(item.get("message") or "upstream audio stream failed")
                     status_code = item.get("status_code")
@@ -581,6 +624,15 @@ def replace_output_assistant_reply(output: str, assistant_reply: str) -> str:
         return output
     data["assistant_reply"] = assistant_reply
     return json.dumps(data, ensure_ascii=False, indent=2)
+
+
+def split_before_partial_tag(text: str, tag: str) -> tuple[str, str]:
+    max_suffix_length = min(len(text), len(tag) - 1)
+    for suffix_length in range(max_suffix_length, 0, -1):
+        suffix = text[-suffix_length:]
+        if tag.startswith(suffix):
+            return text[:-suffix_length], suffix
+    return text, ""
 
 
 def validate_plate_rules(car_plate: str) -> PlateValidationResult:
