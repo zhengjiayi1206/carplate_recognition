@@ -7,7 +7,6 @@ from typing import Any
 from realtime_audio_demo.services.output_filter import extract_json_candidate
 from realtime_audio_demo.services.plate_agent_confirmation import (
     apply_confirmation_actions,
-    confirmation_actions_from_confusions,
 )
 from realtime_audio_demo.services.plate_agent_edit import (
     apply_plate_edit_command,
@@ -283,12 +282,9 @@ class PlateToolExecutor:
             }
 
         confirmed_positions = parse_positions(args.get("confirmed_positions"), len(plate))
-        preserve_confirmed = parse_bool(args.get("preserve_confirmed"), default=self.state.has_car_plate)
         self._write_plate(
             plate,
             confirmed_positions=confirmed_positions,
-            preserve_confirmed=preserve_confirmed,
-            source="tool.set_plate",
         )
         return True, "车牌状态已设置，并已按规则刷新二次确认列表。", {
             "car_plate": self.state.car_plate,
@@ -328,15 +324,15 @@ class PlateToolExecutor:
         if not is_valid_plate_number(result.car_plate):
             return False, "编辑后的车牌格式不合法，状态未更新。", public_edit_result(result)
 
-        self._write_plate(
+        self._write_edited_plate(
             result.car_plate,
-            confirmed_positions=result.changed_positions,
-            preserve_confirmed=True,
-            source=f"tool.{action}",
+            previous_plate=current_plate,
+            command=command,
+            changed_positions=result.changed_positions,
         )
         data = public_edit_result(result)
         data["need_confirm_chars"] = [item.to_public_dict() for item in self.state.need_confirm_chars]
-        return True, "车牌已按工具动作更新，并已按规则刷新二次确认列表。", data
+        return True, "车牌已按工具动作更新，并已更新二次确认列表。", data
 
     def _validate_plate_rules(self, args: dict[str, Any]) -> tuple[bool, str, dict[str, Any]]:
         plate = normalize_candidate_plate(args.get("car_plate") or args.get("plate") or self.state.car_plate)
@@ -359,15 +355,35 @@ class PlateToolExecutor:
             "need_confirm_chars": [item.to_public_dict() for item in confusions],
         }
 
-    def _refresh_confirmation_after_plate_write(self, *, confirmed_positions: list[int], source: str) -> None:
+    def _refresh_confirmation_after_plate_write(
+        self,
+        *,
+        pending_positions: set[int] | None = None,
+        confirmed_positions: set[int] | None = None,
+    ) -> None:
         plate = clean_plate_text(self.state.car_plate)
         if not plate:
             return
         confusions = detect_initial_confusions_by_rule(plate)
-        apply_confirmation_actions(
+        rule_confusion_by_position = {item.position: item for item in confusions}
+        requested_confirmed_set = {
+            position
+            for position in (confirmed_positions or set())
+            if 1 <= position <= len(plate)
+        }
+        pending_set = {
+            position
+            for position in (pending_positions if pending_positions is not None else set(rule_confusion_by_position))
+            if position in rule_confusion_by_position and position not in requested_confirmed_set
+        }
+        confirmed_set = {position for position in requested_confirmed_set if position not in pending_set}
+        refresh_plate_state(
             self.state,
-            confirmation_actions_from_confusions(confusions, confirmed_positions=confirmed_positions),
-            source=f"{source}.auto_confirmation_rules",
+            plate,
+            confusions=[rule_confusion_by_position[position] for position in sorted(pending_set)],
+            confirmed=False,
+            confirmed_positions=sorted(confirmed_set),
+            preserve_confirmed=False,
         )
 
     def _apply_confirmation_action(self, action: str, args: dict[str, Any]) -> tuple[bool, str, dict[str, Any]]:
@@ -408,18 +424,102 @@ class PlateToolExecutor:
         plate: str,
         *,
         confirmed_positions: list[int],
-        preserve_confirmed: bool,
-        source: str,
     ) -> None:
-        # 写入车牌后由后端立即刷新规则待确认位，避免依赖模型再规划一次扫描。
+        # 完整写入车牌时全量刷新规则待确认位。
         refresh_plate_state(
             self.state,
             plate,
             confusions=[],
             confirmed=False,
-            preserve_confirmed=preserve_confirmed,
+            preserve_confirmed=False,
         )
-        self._refresh_confirmation_after_plate_write(confirmed_positions=confirmed_positions, source=source)
+        self._refresh_confirmation_after_plate_write(
+            confirmed_positions={position for position in confirmed_positions if position > 0}
+        )
+
+    def _write_edited_plate(
+        self,
+        plate: str,
+        *,
+        previous_plate: str,
+        command: PlateEditCommand,
+        changed_positions: list[int],
+    ) -> None:
+        pending_positions, confirmed_positions = self._preserved_confirmation_positions_after_edit(
+            previous_plate=previous_plate,
+            new_plate=plate,
+            command=command,
+            changed_positions=changed_positions,
+        )
+        refresh_plate_state(
+            self.state,
+            plate,
+            confusions=[],
+            confirmed=False,
+            preserve_confirmed=False,
+        )
+        self._refresh_confirmation_after_plate_write(
+            pending_positions=pending_positions,
+            confirmed_positions=confirmed_positions,
+        )
+
+    def _preserved_confirmation_positions_after_edit(
+        self,
+        *,
+        previous_plate: str,
+        new_plate: str,
+        command: PlateEditCommand,
+        changed_positions: list[int],
+    ) -> tuple[set[int], set[int]]:
+        pending_positions: set[int] = set()
+        confirmed_positions: set[int] = set()
+        new_plate_text = clean_plate_text(new_plate)
+        changed_set = {position for position in changed_positions if position > 0}
+
+        def keep_status(old_position: int) -> int:
+            if command.action in {"replace_position", "replace_char"}:
+                return 0 if old_position in changed_set else old_position
+            if command.action == "insert_position":
+                insert_position = min(changed_set) if changed_set else 0
+                if insert_position <= 0:
+                    return old_position
+                return old_position if old_position < insert_position else old_position + 1
+            if command.action == "delete_position":
+                delete_position = command.position
+                if old_position <= 0 or delete_position <= 0 or old_position == delete_position:
+                    return 0
+                new_position = old_position if old_position < delete_position else old_position - 1
+                return 0 if new_position == delete_position else new_position
+            return old_position
+
+        for item in self.state.need_confirm_chars:
+            new_position = keep_status(item.position)
+            if self._mapped_value_matches(previous_plate, new_plate_text, item.position, new_position):
+                pending_positions.add(new_position)
+        for item in self.state.confirmed_chars:
+            new_position = keep_status(item.position)
+            if self._mapped_value_matches(previous_plate, new_plate_text, item.position, new_position):
+                confirmed_positions.add(new_position)
+
+        if command.action in {"replace_position", "replace_char", "insert_position"}:
+            confirmed_positions.update(position for position in changed_set if 1 <= position <= len(new_plate_text))
+            pending_positions.difference_update(confirmed_positions)
+        if command.action == "delete_position":
+            delete_position = command.position
+            pending_positions.discard(delete_position)
+            confirmed_positions.discard(delete_position)
+            if 1 <= delete_position <= len(new_plate_text):
+                pending_positions.add(delete_position)
+
+        return pending_positions, confirmed_positions
+
+    @staticmethod
+    def _mapped_value_matches(previous_plate: str, new_plate: str, old_position: int, new_position: int) -> bool:
+        old_index = old_position - 1
+        new_index = new_position - 1
+        if old_index < 0 or old_index >= len(previous_plate) or new_index < 0 or new_index >= len(new_plate):
+            return False
+        return previous_plate[old_index] == new_plate[new_index]
 
 
 def normalize_candidate_plate(value: Any) -> str:
