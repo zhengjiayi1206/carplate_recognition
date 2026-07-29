@@ -4,7 +4,7 @@ import json
 import logging
 import re
 import threading
-from datetime import datetime, timezone
+from datetime import datetime
 from contextvars import ContextVar
 from typing import Any
 
@@ -28,12 +28,9 @@ def state_change_summary(before: dict[str, Any], after: dict[str, Any]) -> dict[
         "confirmed",
         "final_car_plate",
         "vehicle_type",
-        "ack_sent",
         "plate_chars",
         "need_confirm_chars",
         "confirmed_chars",
-        "confusions",
-        "assistant_reply",
     ]
     changes: dict[str, dict[str, Any]] = {}
     for key in keys:
@@ -48,6 +45,8 @@ def state_change_summary(before: dict[str, Any], after: dict[str, Any]) -> dict[
 
 
 def log_node_output(node: str, output: dict[str, Any]) -> None:
+    """普通服务日志：记录节点摘要，不写详细 JSONL 轨迹。"""
+
     before_state = output.get("before_state") or CURRENT_TURN_BEFORE_STATE.get()
     after_state = output.get("after_state") or output.get("state")
     payload: dict[str, Any] = {
@@ -62,11 +61,12 @@ def log_node_output(node: str, output: dict[str, Any]) -> None:
         payload["after_state"] = after_state
     if isinstance(before_state, dict) and isinstance(after_state, dict):
         payload["state_diff"] = state_change_summary(before_state, after_state)
-    write_session_trace(payload)
     logger.info("plate_agent %s", format_node_log_summary(payload))
 
 
 def log_agent_line(message: str, **fields: Any) -> None:
+    """普通服务日志：记录中文摘要，不写详细 JSONL 轨迹。"""
+
     payload: dict[str, Any] = {
         "session_id": CURRENT_SESSION_ID.get() or None,
         "event": "trace_line",
@@ -74,27 +74,132 @@ def log_agent_line(message: str, **fields: Any) -> None:
     }
     if fields:
         payload["详情"] = fields
-    write_session_trace(payload)
     logger.info("plate_agent_trace %s", format_trace_line_summary(payload))
 
 
-def write_session_trace(payload: dict[str, Any]) -> None:
+def log_session_event(event: str, **fields: Any) -> None:
+    """详细 session JSON：一个文件保存一个会话的真实 Agent 轨迹。"""
+
+    session_id = CURRENT_SESSION_ID.get() or None
+    history_entries = build_history_entries(event, fields)
+    for history_entry in history_entries:
+        write_session_trace(session_id=session_id, history_entry=history_entry)
+    history_summary = history_entries[-1] if history_entries else {}
+    payload: dict[str, Any] = {
+        "session_id": session_id,
+        "history": history_summary,
+    }
+    logger.info("plate_agent_event %s", format_session_event_summary(payload))
+
+
+def build_history_entries(event: str, fields: dict[str, Any]) -> list[dict[str, Any]]:
+    if event == "llm_request":
+        status_bar = str(fields.get("status_bar") or "").strip()
+        turn_instruction = str(fields.get("turn_instruction") or "").strip()
+        entries: list[dict[str, Any]] = []
+        if fields.get("input_type") == "audio":
+            content: list[dict[str, Any]] = []
+            request_text = status_bar or turn_instruction
+            if request_text:
+                content.append(
+                    {
+                        "type": "text",
+                        "text": request_text,
+                    }
+                )
+            content.append(
+                {
+                    "type": "audio",
+                    "audio_bytes": fields.get("audio_bytes") or 0,
+                }
+            )
+            entries.append(
+                {
+                    "role": "user",
+                    "content": content,
+                }
+            )
+        elif turn_instruction:
+            entries.append({"role": "user", "content": turn_instruction})
+        return entries
+    return [build_history_entry(event, fields)]
+
+
+def build_history_entry(event: str, fields: dict[str, Any]) -> dict[str, Any]:
+    if event == "turn_start":
+        return {
+            "role": "user",
+            "content": {
+                "type": "audio_turn",
+                "stage": fields.get("stage"),
+                "audio_bytes": fields.get("audio_bytes"),
+                "state": fields.get("state"),
+                "turn_summaries": fields.get("turn_summaries") or [],
+            },
+        }
+    if event == "llm_response":
+        return {
+            "role": "assistant",
+            "content": fields.get("raw_output") or "",
+        }
+    if event == "tool_call":
+        return {
+            "role": "tool",
+            "name": fields.get("tool"),
+            "tool_call_id": fields.get("tool_call_id"),
+            "content": {
+                "arguments": fields.get("arguments") or {},
+                "success": fields.get("success"),
+                "message": fields.get("message"),
+                "result": fields.get("tool_result"),
+            },
+        }
+    if event == "final_response":
+        return {
+            "role": "assistant",
+            "content": fields.get("speech_text") or "",
+        }
+    return {
+        "role": "system",
+        "content": {
+            "type": event,
+            **fields,
+        },
+    }
+
+
+def write_session_trace(*, session_id: str | None, history_entry: dict[str, Any]) -> None:
     if not PLATE_AGENT_TRACE_ENABLED:
         return
-    session_id = str(payload.get("session_id") or "no-session").strip() or "no-session"
-    trace_payload = {
-        "timestamp": datetime.now(timezone.utc).isoformat(),
-        **payload,
-    }
+    normalized_session_id = str(session_id or "no-session").strip() or "no-session"
     try:
-        line = json.dumps(trace_payload, ensure_ascii=False, default=str)
         with _TRACE_LOCK:
-            trace_path = PLATE_AGENT_TRACE_DIR / trace_filename_for_session(session_id)
+            trace_path = PLATE_AGENT_TRACE_DIR / trace_filename_for_session(normalized_session_id)
             trace_path.parent.mkdir(parents=True, exist_ok=True)
-            with trace_path.open("a", encoding="utf-8") as handle:
-                handle.write(line + "\n")
+            document = read_trace_document(trace_path, normalized_session_id)
+            history = document.get("history")
+            if not isinstance(history, list):
+                history = []
+                document["history"] = history
+            history.append(history_entry)
+            trace_path.write_text(json.dumps(document, ensure_ascii=False, indent=2, default=str), encoding="utf-8")
     except Exception as exc:
-        logger.warning("plate_agent trace write failed session_id=%s error=%s", session_id, exc)
+        logger.warning("plate_agent trace write failed session_id=%s error=%s", normalized_session_id, exc)
+
+
+def read_trace_document(trace_path: Any, session_id: str) -> dict[str, Any]:
+    if not trace_path.exists():
+        return {"session_id": session_id, "history": []}
+    try:
+        value = json.loads(trace_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {"session_id": session_id, "history": []}
+    if not isinstance(value, dict):
+        return {"session_id": session_id, "history": []}
+    value["session_id"] = value.get("session_id") or session_id
+    if not isinstance(value.get("history"), list):
+        value["history"] = []
+    return value
 
 
 def safe_session_filename(session_id: str) -> str:
@@ -102,13 +207,13 @@ def safe_session_filename(session_id: str) -> str:
 
 
 def trace_filename_for_session(session_id: str) -> str:
-    """同一个 session 固定写入同一个按时间命名的 JSONL 文件。"""
+    """同一个 session 固定写入同一个按时间命名的 JSON 文件。"""
     safe_session_id = safe_session_filename(session_id)
     filename = _TRACE_FILENAMES_BY_SESSION.get(safe_session_id)
     if filename:
         return filename
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3]
-    filename = f"{timestamp}_{safe_session_id}.jsonl"
+    filename = f"{timestamp}_{safe_session_id}.json"
     _TRACE_FILENAMES_BY_SESSION[safe_session_id] = filename
     return filename
 
@@ -143,6 +248,18 @@ def format_trace_line_summary(payload: dict[str, Any]) -> str:
         "stage": details.get("阶段") or details.get("stage"),
         "action": details.get("action"),
         "detail": short_text(select_detail_text(details)),
+    }
+    return compact_kv(fields)
+
+
+def format_session_event_summary(payload: dict[str, Any]) -> str:
+    history = payload.get("history") if isinstance(payload.get("history"), dict) else {}
+    content = history.get("content") if isinstance(history.get("content"), dict) else {}
+    fields = {
+        "session_id": payload.get("session_id"),
+        "role": history.get("role"),
+        "name": history.get("name"),
+        "success": content.get("success"),
     }
     return compact_kv(fields)
 

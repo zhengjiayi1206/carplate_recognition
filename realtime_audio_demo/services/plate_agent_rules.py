@@ -85,6 +85,14 @@ def detect_initial_confusions_by_rule(car_plate: str) -> list[PlateConfusion]:
     return with_relative_confusion_reasons(plate, confusions)
 
 
+def is_rule_confusion_position(car_plate: str, position: int) -> bool:
+    plate = clean_plate_text(car_plate)
+    if position <= 0 or position > len(plate):
+        return False
+    value = plate[position - 1]
+    return (position == 1 and value in CONFUSION_PROVINCE_CHARS) or value in CONFUSION_ALNUM_CHARS
+
+
 def build_confusion(*, position: int, value: str) -> PlateConfusion:
     return PlateConfusion(
         position=position,

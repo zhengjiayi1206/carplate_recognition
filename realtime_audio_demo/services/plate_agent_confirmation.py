@@ -4,7 +4,12 @@ from typing import Any
 
 from realtime_audio_demo.services.plate_agent_edit import normalize_edit_value, parse_positive_int, parse_json_value
 from realtime_audio_demo.services.plate_agent_logging import log_agent_line, log_node_output
-from realtime_audio_demo.services.plate_agent_rules import clean_plate_text, describe_plate_char, with_relative_confusion_reasons
+from realtime_audio_demo.services.plate_agent_rules import (
+    clean_plate_text,
+    describe_plate_char,
+    is_rule_confusion_position,
+    with_relative_confusion_reasons,
+)
 from realtime_audio_demo.services.plate_agent_state import collect_confirmed_char_keys, refresh_plate_state
 from realtime_audio_demo.services.plate_agent_types import PlateAgentState, PlateConfirmationAction, PlateConfusion
 
@@ -186,7 +191,7 @@ def apply_confirmation_actions(
     current_confusions = {
         item.position: item
         for item in with_relative_confusion_reasons(plate, state.confusions)
-        if item.position > 0
+        if item.position > 0 and is_rule_confusion_position(plate, item.position)
     }
     confirmed_positions = {position for position, _ in collect_confirmed_char_keys(state)}
     confirm_all = False
@@ -216,6 +221,8 @@ def apply_confirmation_actions(
         if action.position <= 0 or action.position > len(plate):
             continue
         if action.action == "add_need_confirmation":
+            if not is_rule_confusion_position(plate, action.position):
+                continue
             value = plate[action.position - 1]
             current_confusions[action.position] = PlateConfusion(
                 position=action.position,

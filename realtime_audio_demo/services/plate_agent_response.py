@@ -25,5 +25,10 @@ def build_output_json(
     return json.dumps(data, ensure_ascii=False, indent=2)
 
 
-def reply_with_pending_confirmation(base_reply: str, state: PlateAgentState) -> str:
-    return build_edit_unclear_reply(state, base_reply=base_reply)
+def reply_with_pending_confirmation(
+    base_reply: str,
+    state: PlateAgentState,
+    *,
+    include_confirmation: bool = True,
+) -> str:
+    return build_edit_unclear_reply(state, base_reply=base_reply, include_confirmation=include_confirmation)

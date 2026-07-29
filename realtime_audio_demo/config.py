@@ -22,6 +22,12 @@ FINAL_MAX_TOKENS = int(os.getenv("FINAL_MAX_TOKENS", "512"))
 REQUEST_TIMEOUT = float(os.getenv("QWEN_REQUEST_TIMEOUT", "180"))
 MAX_HISTORY_TURNS = int(os.getenv("MAX_HISTORY_TURNS", "2"))
 STREAM_FINAL_OUTPUT = os.getenv("STREAM_FINAL_OUTPUT", "1").lower() not in {"0", "false", "off", "no"}
+PLATE_REPLY_INCLUDE_CONFIRMATION = os.getenv("PLATE_REPLY_INCLUDE_CONFIRMATION", "1").lower() not in {
+    "0",
+    "false",
+    "off",
+    "no",
+}
 SILERO_VAD_ENABLED = os.getenv("SILERO_VAD_ENABLED", "1").lower() not in {"0", "false", "off", "no"}
 SILERO_VAD_PRELOAD = os.getenv("SILERO_VAD_PRELOAD", "1").lower() not in {"0", "false", "off", "no"}
 SILERO_VAD_ONNX = os.getenv("SILERO_VAD_ONNX", "0").lower() in {"1", "true", "on", "yes"}

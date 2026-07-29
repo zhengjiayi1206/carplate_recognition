@@ -125,18 +125,66 @@ def stream_json_sync(url: str, payload: dict[str, Any], push: Any) -> None:
 def history_messages(history: Optional[list[dict[str, Any]]] = None) -> list[dict[str, Any]]:
     messages: list[dict[str, Any]] = []
     for item in history or []:
-        role = item.get("role")
-        content = history_item_content(item)
-        if role in {"user", "assistant"} and content:
-            messages.append({"role": role, "content": content})
+        if not isinstance(item, dict):
+            continue
+        message = history_message(item)
+        if message:
+            messages.append(message)
     return messages
 
 
-def history_item_content(item: dict[str, Any]) -> Any:
-    extra = {key: value for key, value in item.items() if key != "role"}
-    if len(extra) > 1:
-        return json.dumps(extra, ensure_ascii=False)
+def history_message(item: dict[str, Any]) -> dict[str, Any] | None:
+    role = item.get("role")
+    if role == "system":
+        content = history_item_content(item)
+        return {"role": "system", "content": content} if content else None
+    if role == "user":
+        content = history_item_content(item)
+        return {"role": "user", "content": content} if content else None
+    if role == "assistant":
+        content = history_item_content(item)
+        tool_calls = normalize_history_tool_calls(item.get("tool_calls"))
+        if tool_calls:
+            return {"role": "assistant", "content": content or None, "tool_calls": tool_calls}
+        return {"role": "assistant", "content": content} if content else None
+    if role == "tool":
+        content = history_item_content(item)
+        tool_call_id = str(item.get("tool_call_id") or "").strip()
+        if content and tool_call_id:
+            return {"role": "tool", "tool_call_id": tool_call_id, "content": content}
+    return None
 
+
+def normalize_history_tool_calls(value: Any) -> list[dict[str, Any]]:
+    if not isinstance(value, list):
+        return []
+    calls: list[dict[str, Any]] = []
+    for index, item in enumerate(value, start=1):
+        if not isinstance(item, dict):
+            continue
+        function = item.get("function") if isinstance(item.get("function"), dict) else {}
+        name = str(function.get("name") or item.get("name") or "").strip()
+        arguments = function.get("arguments") if "arguments" in function else item.get("arguments")
+        if isinstance(arguments, str):
+            arguments_text = arguments
+        else:
+            arguments_text = json.dumps(arguments or {}, ensure_ascii=False)
+        if not name:
+            continue
+        calls.append(
+            {
+                "id": str(item.get("id") or f"call_{index}"),
+                "type": "function",
+                "function": {
+                    "name": name,
+                    "arguments": arguments_text,
+                },
+            }
+        )
+    return calls
+
+
+def history_item_content(item: dict[str, Any]) -> Any:
     content = item.get("content")
     if isinstance(content, str):
         return content.strip()
@@ -144,6 +192,13 @@ def history_item_content(item: dict[str, Any]) -> Any:
         return content
     if content is None:
         return ""
+    extra = {
+        key: value
+        for key, value in item.items()
+        if key not in {"role", "content", "tool_calls", "tool_call_id", "name"}
+    }
+    if extra:
+        return json.dumps(extra, ensure_ascii=False)
     return json.dumps(content, ensure_ascii=False)
 
 
@@ -194,17 +249,24 @@ def build_chat_payload(
     if prompt:
         messages.append({"role": "system", "content": prompt})
     messages.extend(history_messages(history))
-    instruction = (turn_instruction or "请理解这段语音输入，并直接回答用户。").strip()
+    instruction = (
+        "请理解这段语音输入，并直接回答用户。"
+        if turn_instruction is None
+        else str(turn_instruction).strip()
+    )
+    user_content = []
+    if instruction:
+        user_content.append(
+            {
+                "type": "text",
+                "text": instruction,
+            }
+        )
+    user_content.append(audio_item)
     messages.append(
         {
             "role": "user",
-            "content": [
-                {
-                    "type": "text",
-                    "text": instruction,
-                },
-                audio_item,
-            ],
+            "content": user_content,
         }
     )
 
@@ -231,24 +293,24 @@ def build_text_payload(
     modalities: Optional[list[str]] = None,
     response_format: Optional[dict[str, Any]] = None,
 ) -> dict[str, Any]:
-    messages = history_messages(history)
-    content = user_text.strip()
+    messages: list[dict[str, Any]] = []
     prompt = prompt.strip()
-    if prompt and content:
-        content = f"{prompt}\n\n用户输入：{content}"
-    elif prompt:
-        content = prompt
+    if prompt:
+        messages.append({"role": "system", "content": prompt})
+    messages.extend(history_messages(history))
+    content = user_text.strip()
 
     provider = resolved_provider()
-    payload = {
-        "model": model,
-        "messages": [
-            *messages,
+    if content:
+        messages.append(
             {
                 "role": "user",
                 "content": content,
-            },
-        ],
+            }
+        )
+    payload = {
+        "model": model,
+        "messages": messages,
         "max_tokens": max_tokens,
         "temperature": 0,
         "stream": False,
@@ -268,15 +330,13 @@ def normalize_history(value: Any) -> list[dict[str, Any]]:
     for item in value:
         if not isinstance(item, dict):
             continue
-        role = item.get("role")
-        if role not in {"user", "assistant"}:
+        message = history_message(item)
+        if not message:
             continue
-        content = history_item_content(item)
-        if not content:
-            continue
+        content = message.get("content")
         if isinstance(content, str):
-            content = content[:4000]
-        items.append({"role": role, "content": content})
+            message["content"] = content[:4000]
+        items.append(message)
 
     max_messages = max(0, MAX_HISTORY_TURNS * 2)
     if max_messages:

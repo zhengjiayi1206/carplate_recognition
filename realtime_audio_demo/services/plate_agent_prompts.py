@@ -1,168 +1,131 @@
 from __future__ import annotations
 
-import json
-import re
 from typing import Any
 
 from realtime_audio_demo.services.plate_agent_rules import describe_plate_char
 from realtime_audio_demo.services.plate_agent_types import PlateAgentState
 
 
-def build_plate_presence_prompt() -> str:
-    return (
-        "任务：判断用户语音中是否包含车牌号相关内容。"
-        "只回答 true 或 false，不要输出其它内容。"
-        "如果用户说了省份、字母、数字、车牌片段或完整车牌，回答 true。"
-    )
+def build_plate_agent_system_prompt() -> str:
+    """Agent static instruction: role, goals, tool protocol. No dynamic state."""
 
+    return """
+你是车牌语音识别 Agent，不是普通聊天助手，也不是固定流程执行器。你的工作是根据用户语音、当前车牌状态和工具 observation，自主完成车牌识别、纠正、二次确认和最终确认。
 
-def build_plate_edit_command_prompt(
-    state: PlateAgentState,
-    *,
-    current_plate: str | None = None,
-    edit_steps: list[dict[str, Any]] | None = None,
-) -> str:
-    plate = clean_prompt_plate(current_plate if current_plate is not None else state.car_plate)
-    state_context = state.to_context()
-    context = {
-        "current_car_plate": plate,
-        "plate_length": len(plate),
-        "confirmed": state.is_confirmed,
-        "plate_chars": state_context.get("plate_chars") or plate_chars_context(plate),
-        "vehicle_type": state.vehicle_type,
-        "need_confirm_chars": state_context.get("need_confirm_chars", []),
-        "confirmed_chars": state_context.get("confirmed_chars", []),
-        "previous_assistant_reply": state.assistant_reply,
-        "executed_edit_steps": edit_steps or [],
-        "recent_turn_summaries": state_context.get("turn_summaries", []),
-    }
-    context_json = json.dumps(context, ensure_ascii=False, indent=2)
-    context_text = build_plate_edit_context_text(context)
-    return f"""
-任务：听用户最新音频，判断用户是在确认当前车牌，还是在纠正当前车牌，并输出可执行的车牌编辑命令。
+运行环境：
+- 用户每次说话时，输入里会带一段音频；音频旁边可能带有 <agent_status>。
+- <agent_status> 是后端维护的当前状态说明，不是用户原话。它只描述当前暂存车牌、待确认字符、已确认字符和最近历史。
+- 工具调用后会返回 observation。observation 是工具执行后的事实，包括成功/失败、原因、结果和 after_state。
+- 同一轮用户语音内，你可以根据 observation 连续调用工具，也可以直接 finish。不要等待新的用户输入才处理 observation。
 
-请先做简洁、可验证的分析，再给出最终命令。不要输出冗长推理，不要编造用户没有说过的信息。
+核心目标：
+- 如果还没有暂存车牌：从音频里识别完整车牌；没有足够信息就 finish 为 need_more_info。
+- 如果已有暂存车牌：判断用户是在确认、纠正、补充，还是重新说完整车牌。
+- 如果用户在纠正：优先用编辑工具修改当前车牌，不要因为一次修改失败清空旧车牌。
+- 如果用户确认某些易混淆字符：更新 confirmed_chars 和 need_confirm_chars。
+- 只有用户本轮明确确认整车牌正确时，才 finish 为 confirmed。
+- 首轮识别成功、纠错成功、规则校验通过，都只是得到暂存车牌；不要因此直接确认整车牌。
+- 如果当前车牌存在易混淆字符且未确认：让状态进入 need_confirmation，后端会生成用户确认话术。
 
-可用编辑动作：
-- replace_position：按位置替换一位。例：第 3 位改成 R。JSON：{{"action":"replace_position","position":3,"value":"R"}}
-- replace_char：按已有字符替换。例：把临改成 0。JSON：{{"action":"replace_char","old_value":"临","value":"0"}}
-- insert_position：在某一位前面或后面加字符。例：第 3 位后面加 5。JSON：{{"action":"insert_position","position":3,"value":"5","relation":"after"}}
-- delete_position：删除某一位。例：删掉最后一位。JSON：{{"action":"delete_position","position":{len(plate)}}}
-- none：用户只是确认，或者听不出明确修改。JSON：{{"action":"none"}}
+【强制规则：编辑后绝对禁止直接确认】
+- 当你执行了 set_plate、replace_position、replace_char、insert_position、delete_position 且 observation.success 为 true 之后，你必须把修改结果交给用户确认。禁止在同一次对话轮中直接 finish 为 confirmed 来跳过确认。
+- set_plate 和所有编辑工具成功后，后端会自动按规则刷新 observation.after_state.need_confirm_chars。你不需要再调用扫描或刷新工具。
+- 执行写入或编辑后，你的下一步必须是：finish 为 need_confirmation，让用户确认修改后的新车牌。
+- finish confirmed 只在一种情况下合法：用户本轮语音明确表达了"对、正确、确认、没问题、就是这个、好的"等肯定意图，且你本轮没有做过任何编辑操作。
 
-如果用户一次说了多个明确修改，最后输出 actions 列表，例如：
-{{"actions":[{{"action":"replace_position","position":3,"value":"R"}},{{"action":"delete_position","position":{len(plate)}}}]}}
+【关于 observation.after_state 的重要说明】
+- observation.after_state 里的 need_confirm_chars 是后端按规则维护后的待确认字符。
+- 如果 set_plate 或编辑工具成功后 need_confirm_chars 为空，也只是说明没有规则命中的易混淆字符；仍然必须 finish 为 need_confirmation，让用户确认整车牌。
 
-常见读法：洞/零/〇=0，幺/么=1，二/两=2，是=4，陆=6，拐=7，吸=C，勾/沟儿=J，圈=Q。
-位置从 1 开始数。
+【正确的多轮交互流程】
+- 本轮用户纠正了某个字符 → 你用编辑工具改车牌 → finish 为 need_confirmation，等待用户下一轮确认。
+- 本轮用户说"对了"或"没错"→ 你没有做编辑 → 直接 finish 为 confirmed。
+- 本轮用户提供了完整的车牌 → 你用 set_plate 写入 → finish 为 need_confirmation。
+
+【错误示例——这些行为是禁止的】
+- 用户说"第三个字是A"→ 你调用 replace_position 成功 → 你直接 finish 为 confirmed。错误！用户只是在纠正，没有确认整车牌。
+- 用户说"把B换成A"→ 你调用 replace_char 成功 → 看到 need_confirm_chars 为空 → 你直接 finish 为 confirmed。错误！必须等待用户确认修改后的新车牌。
+- 用户说"是京A12345"→ 你调用 set_plate → 直接 finish 为 confirmed。错误！首轮识别必须进入 need_confirmation。
+
+状态和工具原则：
+- 车牌状态只能通过工具改变；你的文字判断不会修改状态。
+- 工具不是固定步骤。是否 set、edit、validate、detect、confirm，由你根据当前信息决定。
+- 如果你要写入完整车牌，用 set_plate。
+- 如果你要改当前车牌的一位、某个字符、插入或删除，用编辑工具。
+- 如果你要知道车牌是否合法，用 validate_plate_rules。
+- 如果你要发现哪些字符需要二次确认，用 detect_confusions_by_rules。
+- 待二次确认字符由后端按规则维护，只包括重点易混淆列表里的字符；不要自己新增待确认字符。
+- 如果用户已经确认某位字符，用 add_confirmed 或 remove_need_confirmation。
+- finish confirmed 只能用于用户明确表达"对、正确、确认、没问题、就是这个"等整车牌确认意图，且本轮没有做过任何编辑。
+- 如果工具失败，读取 observation.message 和 after_state，再决定换工具、结束为 unclear/invalid，或保留原车牌继续确认。
+
+可用工具：
+- get_current_state()：读取当前状态。
+- set_plate(car_plate, confirmed_positions?, preserve_confirmed?)：设置完整车牌，成功后后端自动刷新待确认字符。
+- validate_plate_rules(car_plate?)：校验车牌规则，不修改状态。
+- detect_confusions_by_rules(car_plate?)：扫描易混淆字符，不修改状态。
+- replace_position(position, value)：替换指定位置字符。
+- replace_char(old_value, value, occurrence?)：替换指定字符，occurrence 可为 first、last、all。
+- insert_position(position, value, relation?)：在指定位置 before/after 插入字符。
+- delete_position(position)：删除指定位置字符，后续字符自动前移。
+- remove_need_confirmation(position)：移出待二次确认。
+- add_confirmed(position)：加入已确认字符。
+- remove_confirmed(position)：移出已确认字符。
+
+车牌知识：
+- 第 1 位是中文省份简称，第 2 位是英文字母。
+- 普通燃油车 7 位，新能源车 8 位。
+- 后续字符通常是数字或大写英文字母。
+- 特殊尾字可为警、临、学、领、挂。
+- 常见语音转换：洞/零/〇=0，幺/么=1，二/两=2，是=4，陆=6，拐=7，吸=C，勾/沟儿=J，圈=Q。
+- 需要重点二次确认的易混淆字符：2、R、1、E、甘、赣、津、京、桂、贵、冀、吉。
 
 输出要求：
-【问题理解】
-用一句话说明你听到的用户意图：确认、替换、插入、删除，或不明确。
-
-【关键分析】
-简洁说明你如何根据当前车牌、历史摘要、待确认字符和已确认字符定位到要处理的位置或字符。
-如果用户说的是读音，说明转换后的标准字符。
-如果用户没有给出明确修改，说明为什么不能执行修改。
-
-【最终答案】
-先用一句话说明最终选择的动作。
-然后单独输出一个完整 JSON 对象；后端只读取最后这个 JSON。
-
-【置信度】
-输出高、中或低，并简要说明原因。
-
-当前车牌状态：
-{context_text}
-
-结构化状态：
-{context_json}
-""".strip()
+- 每次只输出一个 JSON 对象，不输出自然语言对话。
+- thought 只写简短判断，不写长篇推理。
+- 需要工具时输出：
+  {"thought":"简短判断","tool_calls":[{"name":"工具名","arguments":{...}}]}
+- 不需要工具时输出：
+  {"thought":"简短判断","finish":{"task_status":"need_more_info|need_confirmation|confirmed|invalid|unclear","reply_scene":"initial_success|update_success|partial_confirmation|confirmed|need_more_info|edit_unclear|invalid"}}
+- tool_calls 和 finish 不能同时输出。
+- 如果已经调用工具并看到 observation，下一次输出必须基于 observation，而不是重复上一次计划。
+ """.strip()
 
 
-def build_confirmation_state_action_prompt(context: dict[str, Any]) -> str:
-    context_text = build_confirmation_state_context_text(context)
-    return f"""
-任务：根据用户最新音频和当前车牌状态，更新二次确认列表和已确认字符。
+def build_plate_agent_status_bar(
+    *,
+    state: PlateAgentState,
+) -> str:
+    """Status bar injected once with the user audio on the first agent iteration."""
 
-你只处理确认状态，不修改车牌号本身。可以先简短判断用户这句话确认了什么、还有什么需要继续确认；最后单独输出一个 JSON，后端只读取最后这个 JSON。
-
-可用动作：
-- clear_need_confirmation：重新计算当前车牌的二次确认列表。
-- add_need_confirmation：某一位还需要继续问用户确认。例：{{"action":"add_need_confirmation","position":3}}
-- remove_need_confirmation：某一位不需要再二次确认。
-- add_confirmed：用户已经明确确认某一位是对的，或者本轮成功修改到了这一位。
-- remove_confirmed：用户否定了之前确认过的某一位。
-- none：确认状态没有明确变化。
-
-多个动作输出 actions 列表，例如：
-{{"actions":[{{"action":"clear_need_confirmation"}},{{"action":"add_confirmed","position":1}},{{"action":"add_need_confirmation","position":3}}]}}
-
-当前确认状态：
-{context_text}
-
-结构化确认状态：
-{json.dumps(context, ensure_ascii=False, indent=2)}
-""".strip()
-
-
-def build_confirmation_state_context_text(context: dict[str, Any]) -> str:
+    context = state.to_context()
+    current_plate = str(context.get("car_plate") or "").strip()
     lines = [
-        f"- 当前暂存车牌：{context.get('car_plate') or '空'}",
-        f"- 当前车牌长度：{context.get('plate_length') or 0} 位",
-        f"- 车辆类型：{vehicle_type_text(context.get('vehicle_type'))}",
-    ]
-    need_confirm = describe_state_chars(context.get("need_confirm_chars"))
-    lines.append(f"- 当前还需要二次确认：{need_confirm or '无'}")
-    confirmed = describe_state_chars(context.get("confirmed_chars"))
-    lines.append(f"- 已经确认的字符：{confirmed or '无'}")
-    rule_confusions = describe_state_chars(context.get("rule_confusions"))
-    lines.append(f"- 按规则当前可能需要确认的位置：{rule_confusions or '无'}")
-    review_positions = context.get("confirmed_positions_from_review") or []
-    if review_positions:
-        lines.append(f"- 上一步复核认为用户本轮已经确认的位置：{review_positions}")
-    assistant_reply = str(context.get("assistant_reply") or "").strip()
-    if assistant_reply:
-        lines.append(f"- 上一轮 AI 回复：{assistant_reply}")
-    summaries = [str(item).strip() for item in context.get("recent_turn_summaries") or [] if str(item).strip()]
-    if summaries:
-        lines.append("- 最近历史摘要：")
-        lines.extend(f"  {index}. {summary}" for index, summary in enumerate(summaries[-6:], start=1))
-    return "\n".join(lines)
-
-
-def build_plate_edit_context_text(context: dict[str, Any]) -> str:
-    plate = str(context.get("current_car_plate") or "").strip()
-    lines = [
-        f"- 当前暂存车牌：{plate or '空'}",
-        f"- 当前车牌长度：{context.get('plate_length') or 0} 位",
-        f"- 当前是否已经整车牌确认：{'是' if context.get('confirmed') else '否'}",
-        f"- 车辆类型：{vehicle_type_text(context.get('vehicle_type'))}",
+        "<agent_status>",
+        "当前车牌状态：",
+        f"- 是否已有暂存车牌：{yes_no(state.has_car_plate)}",
+        f"- 当前暂存车牌：{current_plate or '空'}",
+        f"- 车牌长度：{len(current_plate)}",
+        f"- 车牌类型：{vehicle_type_text(context.get('vehicle_type'))}",
+        f"- 是否整车确认：{yes_no(state.is_confirmed)}",
+        f"- 最终确认车牌：{context.get('final_car_plate') or '空'}",
     ]
 
     plate_chars = describe_plate_chars(context.get("plate_chars"))
-    if plate_chars:
-        lines.append(f"- 当前车牌逐位内容：{plate_chars}")
-
+    lines.append(f"- 车牌字符：{plate_chars or '无'}")
     need_confirm = describe_state_chars(context.get("need_confirm_chars"))
-    lines.append(f"- 当前还需要用户二次确认：{need_confirm or '无'}")
-
+    lines.append(f"- 待二次确认字符：{need_confirm or '无'}")
     confirmed = describe_state_chars(context.get("confirmed_chars"))
-    lines.append(f"- 用户已经明确确认过的字符：{confirmed or '无'}")
+    lines.append(f"- 已确认字符：{confirmed or '无'}")
 
-    previous_reply = str(context.get("previous_assistant_reply") or "").strip()
-    if previous_reply:
-        lines.append(f"- 上一轮 AI 回复给用户的话：{previous_reply}")
-
-    summaries = [str(item).strip() for item in context.get("recent_turn_summaries") or [] if str(item).strip()]
+    summaries = [str(item).strip() for item in context.get("turn_summaries") or [] if str(item).strip()]
     if summaries:
-        lines.append("- 最近历史摘要：")
-        lines.extend(f"  {index}. {summary}" for index, summary in enumerate(summaries[-6:], start=1))
+        lines.append("最近历史：")
+        lines.extend(f"- {summary}" for summary in summaries[-6:])
+    else:
+        lines.append("最近历史：无")
 
-    edit_steps = context.get("executed_edit_steps")
-    if isinstance(edit_steps, list) and edit_steps:
-        lines.append(f"- 本轮已经执行过 {len(edit_steps)} 次编辑尝试，后续判断不要重复已经完成的动作。")
-
+    lines.append("</agent_status>")
     return "\n".join(lines)
 
 
@@ -190,11 +153,7 @@ def describe_state_chars(value: Any) -> str:
         char = str(item.get("value") or item.get("char") or "").strip()
         if not position or not char:
             continue
-        reason = str(item.get("reason") or "").strip().rstrip("。")
-        text = f"第{position}位={describe_plate_char(char)}"
-        if reason:
-            text += f"（{reason}）"
-        descriptions.append(text)
+        descriptions.append(f"第{position}位={describe_plate_char(char)}")
     return "，".join(descriptions)
 
 
@@ -204,88 +163,10 @@ def vehicle_type_text(value: Any) -> str:
         return "普通燃油车号牌"
     if raw == "new_energy":
         return "新能源车号牌"
-    return raw or "未知"
+    if not raw or raw == "unknown":
+        return "未知"
+    return raw
 
 
-def build_confirmation_detection_prompt(previous_ai_reply: str) -> str:
-    return build_confirmation_detection_prompt_with_history(previous_ai_reply, [])
-
-
-def build_confirmation_detection_prompt_with_history(previous_ai_reply: str, turn_summaries: list[str]) -> str:
-    history_text = "\n".join(f"- {item}" for item in turn_summaries[-6:] if str(item).strip())
-    history_block = f"\n\n## 历史摘要\n{history_text}" if history_text else ""
-    return (
-        "任务：判断用户是否在确认上一轮 AI 所说的车牌信息。\n\n"
-        "## 判断逻辑\n"
-        "分析用户语音是否明确确认了 AI 刚才说的车牌号。"
-        "用户可能说的确认话术包括：对、是的、没错、正确、就是这个、确认、嗯对、就是这样、可以了。\n"
-        "用户可能说的否认话术包括：不对、修改、不是、某一位错了、听错了、不是这个、我重新说。\n\n"
-        "## 输出要求\n"
-        "只回答 yes 或 no，不要输出其它内容。\n"
-        "yes = 用户确认了上一轮 AI 说出的车牌号\n"
-        "no = 用户否认、纠正或要求修改\n\n"
-        "## 上一轮 AI 对用户说的话\n"
-        f"{previous_ai_reply}"
-        f"{history_block}"
-    )
-
-
-def build_plate_update_review_prompt(context: dict[str, Any]) -> str:
-    return f"""
-任务：对刚才的车牌编辑步骤做一次 ReAct 复核，但不要直接改车牌。
-
-你需要根据同一段用户语音和当前上下文判断：
-1. 用户这轮到底是在确认哪些位、修改哪些位，还是还有未处理的修改意图。
-2. 已执行的 command / commands 是否已经覆盖用户意图。
-3. after_plate 是否是一个合理的中间或最终结果。
-4. 用户本轮明确确认过的车牌位置有哪些，需要加入 confirmed_positions。
-
-当前上下文：
-{json.dumps(context, ensure_ascii=False)}
-
-判断规则：
-1. 如果用户明确说某个待确认字符是对的，例如“天津的津对”“那个 R 没错”，把对应 position 放进 confirmed_positions。
-2. 如果用户明确把某一位改成新字符，且本轮 command / commands 正确执行了这个修改，也把该 position 放进 confirmed_positions。
-3. 如果修改后的字符已经不是易混淆字符，后端会自动从 need_confirm_chars 删除；你只需要把用户明确确认的位置输出出来。
-4. 如果用户还表达了另一个未处理的修改动作，needs_more_edit=true。
-5. 如果当前编辑动作和用户语音明显不一致，valid_result=false。
-6. 如果本轮一个或多个编辑动作已经覆盖用户意图，needs_more_edit=false。
-7. 不要输出推理过程，不要输出自然语言，只输出 JSON。
-
-输出 JSON 字段：
-{{
-  "confirmed_positions": [1, 4],
-  "needs_more_edit": false,
-  "valid_result": true,
-  "reason": "简短说明"
-}}
-""".strip()
-
-
-def build_province_retry_prompt(formatted_plate: str) -> str:
-    return f"""
-任务：当前暂时的车牌识别结果第一位不是省份简称，请根据用户音频重新识别车牌号。
-当前暂时识别结果：{formatted_plate}
-
-请输出带省份简称的完整车牌号码。
-车牌第一位必须是省份简称，例如：京、津、冀、晋、蒙、辽、吉、黑、沪、苏、浙、皖、闽、赣、鲁、豫、鄂、湘、粤、桂、琼、渝、川、贵、云、藏、陕、甘、青、宁、新。
-只输出 JSON 对象，字段为 car_plate。
-""".strip()
-
-
-def clean_prompt_plate(value: Any) -> str:
-    return re.sub(r"\s+", "", str(value or "")).strip().upper()
-
-
-def plate_chars_context(plate: str) -> list[dict[str, Any]]:
-    return [
-        {
-            "position": index,
-            "value": value,
-            "confirmed": False,
-            "needs_confirmation": False,
-            "candidates": [],
-            "reason": "",
-        }
-        for index, value in enumerate(plate, start=1)
-    ]
+def yes_no(value: Any) -> str:
+    return "是" if bool(value) else "否"

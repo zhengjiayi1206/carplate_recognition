@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from realtime_audio_demo.services.plate_agent_rules import clean_plate_text, describe_plate_char, with_relative_confusion_reasons
+from realtime_audio_demo.services.plate_agent_rules import clean_plate_text, describe_plate_char, is_rule_confusion_position
 from realtime_audio_demo.services.plate_agent_types import PlateAgentState
 
 
@@ -101,8 +101,9 @@ INITIAL_SUCCESS_TEMPLATE = "我识别到的车牌号是{plate}。"
 UPDATE_SUCCESS_TEMPLATE = "已按您的说明更新为{plate}。"
 
 # 用户只确认了部分待确认字符，但还没有确认完整车牌时返回。
+# {plate} 必须保留，后端会替换成当前暂存车牌。
 # 后面会自动追加剩余待确认内容；如果没有剩余待确认项，会提示确认整车牌。
-PARTIAL_CONFIRMATION_TEMPLATE = "好的，已记录您的确认。"
+PARTIAL_CONFIRMATION_TEMPLATE = "好的，已记录您对车牌{plate}的确认。"
 
 # 用户明确确认完整车牌后返回。
 # {plate} 必须保留，后端会替换成最终车牌；这句话通常是任务结束话术。
@@ -121,28 +122,49 @@ NO_PENDING_CONFIRMATION_TEMPLATE = "请您确认{plate}是否正确。"
 NEW_ENERGY_CONFIRMATION_TEXT = "另外这是新能源号牌吗？"
 
 
-def build_initial_success_reply(state: PlateAgentState) -> str:
-    return with_pending_confirmation(INITIAL_SUCCESS_TEMPLATE.format(plate=display_plate(state)), state)
+def build_initial_success_reply(state: PlateAgentState, *, include_confirmation: bool = True) -> str:
+    return with_pending_confirmation(
+        INITIAL_SUCCESS_TEMPLATE.format(plate=display_plate(state)),
+        state,
+        include_confirmation=include_confirmation,
+    )
 
 
-def build_update_success_reply(state: PlateAgentState) -> str:
-    return with_pending_confirmation(UPDATE_SUCCESS_TEMPLATE.format(plate=display_plate(state)), state)
+def build_update_success_reply(state: PlateAgentState, *, include_confirmation: bool = True) -> str:
+    return with_pending_confirmation(
+        UPDATE_SUCCESS_TEMPLATE.format(plate=display_plate(state)),
+        state,
+        include_confirmation=include_confirmation,
+    )
 
 
-def build_partial_confirmation_reply(state: PlateAgentState) -> str:
-    return with_pending_confirmation(PARTIAL_CONFIRMATION_TEMPLATE, state)
+def build_partial_confirmation_reply(state: PlateAgentState, *, include_confirmation: bool = True) -> str:
+    return with_pending_confirmation(
+        PARTIAL_CONFIRMATION_TEMPLATE.format(plate=display_plate(state)),
+        state,
+        include_confirmation=include_confirmation,
+    )
 
 
 def build_confirmed_reply(plate: str) -> str:
     return CONFIRMED_REPLY_TEMPLATE.format(plate=clean_plate_text(plate))
 
 
-def build_edit_invalid_reply(state: PlateAgentState) -> str:
-    return with_pending_confirmation(EDIT_INVALID_REPLY.format(plate=display_plate(state)), state)
+def build_edit_invalid_reply(state: PlateAgentState, *, include_confirmation: bool = True) -> str:
+    return with_pending_confirmation(
+        EDIT_INVALID_REPLY.format(plate=display_plate(state)),
+        state,
+        include_confirmation=include_confirmation,
+    )
 
 
-def build_edit_unclear_reply(state: PlateAgentState, base_reply: str | None = None) -> str:
-    return with_pending_confirmation(base_reply or EDIT_UNCLEAR_REPLY, state)
+def build_edit_unclear_reply(
+    state: PlateAgentState,
+    base_reply: str | None = None,
+    *,
+    include_confirmation: bool = True,
+) -> str:
+    return with_pending_confirmation(base_reply or EDIT_UNCLEAR_REPLY, state, include_confirmation=include_confirmation)
 
 
 def build_keep_current_plate_reply(plate: str) -> str:
@@ -157,20 +179,33 @@ def build_duplicate_char_reply(value: str) -> str:
     return EDIT_DUPLICATE_CHAR_TEMPLATE.format(char=describe_plate_char(value))
 
 
-def build_fixed_reply(state: PlateAgentState, *, changed: bool, scene: str = "") -> str:
+def build_fixed_reply(
+    state: PlateAgentState,
+    *,
+    changed: bool,
+    scene: str = "",
+    include_confirmation: bool = True,
+) -> str:
     """根据当前业务场景选择固定回复模板。"""
     if scene == "initial_success":
-        return build_initial_success_reply(state)
+        return build_initial_success_reply(state, include_confirmation=include_confirmation)
     if scene == "partial_confirmation":
-        return build_partial_confirmation_reply(state)
+        return build_partial_confirmation_reply(state, include_confirmation=include_confirmation)
     if scene == "update_success" or changed:
-        return build_update_success_reply(state)
-    return build_edit_unclear_reply(state)
+        return build_update_success_reply(state, include_confirmation=include_confirmation)
+    return build_edit_unclear_reply(state, include_confirmation=include_confirmation)
 
 
-def with_pending_confirmation(base_reply: str, state: PlateAgentState) -> str:
+def with_pending_confirmation(
+    base_reply: str,
+    state: PlateAgentState,
+    *,
+    include_confirmation: bool = True,
+) -> str:
     """在基础回复后追加二次确认内容。"""
     reply = ensure_sentence(base_reply)
+    if not include_confirmation:
+        return reply
     pending = pending_confirmation_text(state)
     if pending:
         reply += PENDING_CONFIRMATION_TEMPLATE.format(pending=pending)
@@ -188,13 +223,16 @@ def pending_confirmation_text(state: PlateAgentState) -> str:
 
 def pending_confirmation_descriptions(state: PlateAgentState) -> list[str]:
     """把待确认字符转成用户可听懂的描述，例如“第1位是天津的津”。"""
-    items = state.need_confirm_chars or with_relative_confusion_reasons(state.car_plate, state.confusions)
+    items = state.need_confirm_chars
     descriptions: list[str] = []
     seen_positions: set[int] = set()
+    plate = clean_plate_text(state.car_plate)
     for item in items:
         position = int(getattr(item, "position", 0) or 0)
         value = str(getattr(item, "value", "") or "").strip()
         if position <= 0 or not value or position in seen_positions:
+            continue
+        if not is_rule_confusion_position(plate, position):
             continue
         seen_positions.add(position)
         descriptions.append(f"第{position}位是{describe_plate_char(value)}")
